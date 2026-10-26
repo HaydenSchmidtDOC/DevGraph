@@ -1,7 +1,7 @@
 """Graph data serializers for `devgraph export`.
 
 Each format serializer takes the same raw node/edge lists (from
-`dashboard/queries.py`'s `graph_slice` or a direct Cypher query) and
+`dashboard/queries.py`'s `export_slice`) and
 returns a string in the requested format.
 """
 
@@ -49,16 +49,17 @@ def export_dot(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> str:
     """Export as Graphviz DOT format.
 
     Each node becomes a labeled vertex; each edge becomes a directed edge.
+    Node ids are quoted: a Neo4j element id (`4:<uuid>:12`) is no bare DOT ID.
     """
     lines: list[str] = ["digraph DevGraph {"]
     for n in nodes:
-        nid = _dot_id(n.get("id", ""))
+        nid = _quote(n.get("id", ""))
         label = n.get("name") or n.get("label", "")
         lines.append(f"  {nid} [label={_quote(label)}];")
 
     for e in edges:
-        src = _dot_id(e.get("source", ""))
-        tgt = _dot_id(e.get("target", ""))
+        src = _quote(e.get("source", ""))
+        tgt = _quote(e.get("target", ""))
         rel = e.get("rel_type", "")
         lines.append(f"  {src} -> {tgt} [label={_quote(rel)}];")
 
@@ -72,14 +73,6 @@ def _quote(s: str | int | float | bool) -> str:
         escaped = s.replace("\\", "\\\\").replace('"', '\\"')
         return f'"{escaped}"'
     return str(s)
-
-
-def _dot_id(s: str) -> str:
-    """Sanitize a string for use as a DOT node ID."""
-    if not s:
-        return '""'
-    sanitized = "".join(c if c.isalnum() or c in ("_", "-") else "_" for c in s)
-    return sanitized if sanitized else '""'
 
 
 def _format_props(props: dict[str, Any]) -> str:

@@ -34,7 +34,12 @@ from devgraph.config.edits import removed_types as _removed_types  # noqa: F401 
 from devgraph.config.schema_findings import project_schema_findings as _project_schema_findings
 from devgraph.dashboard import queries as dashboard_queries
 from devgraph.dashboard.url import dashboard_url, probe_dashboard
-from devgraph.graph.engine import GraphEngine, provision_repository_schema
+from devgraph.graph.engine import (
+    GraphEngine,
+    foreign_graph_data,
+    provision_repository_schema,
+    taken_by_another_repository,
+)
 from devgraph.indexer.dispatch import full_scan, full_scan_elsewhere
 from devgraph.indexer.docs.extractor import index_file as index_doc_file
 from devgraph.indexer.git_history.extractor import sync_git_history
@@ -126,15 +131,29 @@ def add(
             if existing is not None:
                 console.print(f"[green][OK][/green] Already registered: {escape(existing.repo_id)} at {escape(str(existing.path))}")
                 return
-            record = registry.add_repo(path)
-            console.print(
-                f"[green][OK][/green] Registered: {escape(record.repo_id)} at {escape(str(record.path))}"
-            )
-
+            settings = get_settings()
+            engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
             try:
-                settings = get_settings()
-                engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
+                held: list[str] = []
+                record = registry.add_repo(path, is_taken=taken_by_another_repository(engine, resolved, held))
+                console.print(
+                    f"[green][OK][/green] Registered: {escape(record.repo_id)} at {escape(str(record.path))}"
+                )
+                if held:
+                    console.print(
+                        f"[yellow]The graph already holds another repository's data under "
+                        f"{escape(', '.join(held))}[/yellow], so this one is {escape(record.repo_id)}. That data is "
+                        "left in place: if no other DevGraph install on this Neo4j uses it, 'devgraph prune' deletes it.",
+                        soft_wrap=True,
+                    )
+
                 try:
+                    # Registration counts an id it couldn't check (Neo4j slow
+                    # or down) as free: never scan into another repository's data.
+                    problem = foreign_graph_data(engine, record.repo_id, record.path)
+                    if problem:
+                        console.print(f"[red][X] Error:[/red] {escape(problem)}", soft_wrap=True)
+                        raise typer.Exit(code=1)
                     provision_repository_schema(engine, record.path)
                     engine.upsert_repository(record.repo_id, record.repo_id, str(record.path))
                     started = datetime.now(timezone.utc)
@@ -156,18 +175,20 @@ def add(
                                 f"[yellow]Full scan complete but history indexing failed:[/yellow] {escape(str(e))}\n"
                                 f"  Run 'devgraph index-history {escape(record.repo_id)}' to retry."
                             )
-                finally:
-                    engine.close()
-            except Exception as e:
-                # Registration already succeeded (SQLite committed above) — an
-                # indexing failure (e.g. Neo4j unreachable) shouldn't undo that.
-                # `devgraph rescan <repo_id>` retries the scan once Neo4j is up.
-                console.print(
-                    f"[yellow]Registered but initial scan failed:[/yellow] {escape(_neo4j_problem(e, settings))}\n"
-                    f"  Fix that, then run 'devgraph rescan {escape(record.repo_id)}' to index it.",
-                    soft_wrap=True,
-                )
-                raise typer.Exit(code=1)
+                except typer.Exit:
+                    raise
+                except Exception as e:
+                    # Registration already succeeded (SQLite committed above) — an
+                    # indexing failure (e.g. Neo4j unreachable) shouldn't undo that.
+                    # `devgraph rescan <repo_id>` retries the scan once Neo4j is up.
+                    console.print(
+                        f"[yellow]Registered but initial scan failed:[/yellow] {escape(_neo4j_problem(e, settings))}\n"
+                        f"  Fix that, then run 'devgraph rescan {escape(record.repo_id)}' to index it.",
+                        soft_wrap=True,
+                    )
+                    raise typer.Exit(code=1)
+            finally:
+                engine.close()
         finally:
             registry.close()
     except typer.Exit:
@@ -177,6 +198,16 @@ def add(
         raise typer.Exit(code=1)
     except Exception as e:
         console.print(f"[red][X] Unexpected error:[/red] {escape(str(e))}")
+        raise typer.Exit(code=1)
+
+
+def _refuse_foreign_graph_data(engine: GraphEngine, repo: Any) -> None:
+    """Exit 1 before the first write to a never-indexed repository whose id
+    holds another repository's graph data (`foreign_graph_data`): it was
+    registered while that couldn't be checked, and is never merged into it."""
+    problem = None if repo.last_indexed else foreign_graph_data(engine, repo.repo_id, repo.path)
+    if problem:
+        console.print(f"[red][X] Error:[/red] {escape(problem)}", soft_wrap=True)
         raise typer.Exit(code=1)
 
 
@@ -385,6 +416,7 @@ def rescan(
             settings = get_settings()
             engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
             try:
+                _refuse_foreign_graph_data(engine, repo)
                 provision_repository_schema(engine, repo.path)
                 engine.upsert_repository(repo_id, repo_id, str(repo.path))
                 holder = full_scan_elsewhere(engine, repo_id)
@@ -643,6 +675,7 @@ def annotate(
                     settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password
                 )
                 try:
+                    _refuse_foreign_graph_data(engine, repo)
                     engine.init_schema()
                     index_doc_file(engine, repo_id, note_path, repo.path)
                     console.print(f"[green][OK][/green] Indexed note: {escape(note)}")
@@ -689,6 +722,7 @@ def index_history(
             settings = get_settings()
             engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
             try:
+                _refuse_foreign_graph_data(engine, repo)
                 engine.init_schema()
                 result = sync_git_history(engine, registry, repo_id, max_count=max_count)
                 console.print(f"[green][OK][/green] Indexed {result['commits_indexed']} new commit(s) for {escape(repo_id)}")
@@ -2098,7 +2132,7 @@ def dashboard(
 @app.command()
 def stats(
     repo_id: Optional[str] = typer.Argument(
-        None, help="Repository ID. Omit for aggregate stats across all repos."
+        None, help="Repository ID. Omit for aggregate stats across all registered repos."
     ),
     as_json: bool = typer.Option(
         False, "--json", help="Output as JSON instead of a table."
@@ -2127,7 +2161,12 @@ def stats(
             total_nodes = sum(data["nodes_by_label"].values())
             total_rels = sum(data["relationships_by_type"].values())
         else:
-            data = dashboard_queries.total_counts(engine)
+            registry = _get_registry()
+            try:
+                registered_ids = [r.repo_id for r in registry.list_repos()]
+            finally:
+                registry.close()
+            data = dashboard_queries.total_counts(engine, registered_ids)
             total_nodes = sum(data["nodes_by_label"].values())
             total_rels = sum(data["relationships_by_type"].values())
 
@@ -2564,14 +2603,40 @@ def _default_repo_root() -> tuple[Path, bool]:
     return (_repo_dir(Path(match.path)), True) if match is not None else (cwd, False)
 
 
+def _git_toplevel(directory: Path) -> Path | None:
+    """`git rev-parse --show-toplevel` from `directory`; None outside a git
+    repository or without git installed."""
+    try:
+        top = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"], cwd=str(directory), capture_output=True, text=True,
+        )
+    except OSError:
+        return None
+    return Path(top.stdout.strip()).resolve() if top.returncode == 0 and top.stdout.strip() else None
+
+
 @config_app.command("eject")
 def config_eject(
-    repo: Path = typer.Option(Path("."), "--repo", help="Repository root (default: current directory)."),
+    repo: Optional[Path] = typer.Option(
+        None, "--repo",
+        help="Repository root (default: the git repository containing the current directory when it is "
+        "not registered or nests inside a registered one, else the registered repository, else the current directory).",
+    ),
 ) -> None:
     """Write a commented starter devgraph.schema.yaml. Never overwrites an existing file."""
     from devgraph.config.project_schema import project_schema_path, starter_schema_text
 
-    path = project_schema_path(_repo_dir(repo))
+    if repo is not None:
+        root = _repo_dir(repo)
+    else:
+        root, registered = _default_repo_root()
+        # The git repository containing the current directory, where
+        # registering it will read the file, when no registered repository
+        # contains it or it is a repository nested deeper inside one.
+        top = _git_toplevel(_repo_dir(Path(".")))
+        if top is not None and (not registered or (top != root and is_within(top, root))):
+            root = top
+    path = project_schema_path(root)
     try:
         # Exclusive create: also refuses a symlink or a file that appeared
         # after any check we could have made.
@@ -3632,7 +3697,7 @@ def logs(
             count += len(record_lines)
     for record_lines in reversed(shown):
         for line in record_lines:
-            console.print(escape(line))
+            console.print(escape(line), soft_wrap=True)  # unfolded, so `devgraph logs | grep` sees whole lines
 
 
 @app.command()
@@ -3640,8 +3705,14 @@ def prune(
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Show what would be deleted without actually deleting."
     ),
+    yes: bool = typer.Option(False, "--yes", help="Delete without asking for confirmation."),
 ) -> None:
-    """Remove orphaned graph data for repos no longer in the registry."""
+    """Delete the graph data of every repo id this registry doesn't hold.
+
+    That includes the repositories of any other DevGraph registry sharing the
+    same Neo4j: the ids are listed first, and deleting needs a confirmation at
+    a terminal or --yes.
+    """
     settings = get_settings()
     registry = _get_registry()
     try:
@@ -3665,15 +3736,42 @@ def prune(
             console.print("[green]No orphaned repos found.[/green]")
             return
 
-        console.print(f"Found {len(orphaned)} orphaned repo(s):")
+        counts = engine.repo_node_counts(orphaned)
+        console.print(f"Found {len(orphaned)} repo id(s) in Neo4j that this registry doesn't hold:")
         for rid in sorted(orphaned):
-            console.print(f"  {escape(str(rid))}")
+            console.print(f"  {escape(str(rid))} ({escape(str(counts.get(rid, 0)))} node(s))", soft_wrap=True)
+        console.print(
+            "[yellow]If another DevGraph install (another user, WSL, a container deployment, a test run) "
+            "uses this Neo4j, these may be its repositories: deleting them deletes its data.[/yellow]",
+            soft_wrap=True,
+        )
 
         if dry_run:
             console.print("[yellow]Dry run — no data deleted.[/yellow]")
             return
+        if not yes:
+            if not _stdin_is_tty():
+                console.print(
+                    "[red][X] Not deleted:[/red] no terminal to confirm on; review the list above, "
+                    "then run 'devgraph prune --yes'.",
+                    soft_wrap=True,
+                )
+                raise typer.Exit(code=1)
+            if not typer.confirm(f"Delete the graph data of these {len(orphaned)} repo id(s)?", default=False):
+                console.print("Nothing deleted.")
+                raise typer.Exit(code=1)
 
         for rid in sorted(orphaned):
+            # Read again right before each delete: a registration since the
+            # list was read (the dashboard, another `devgraph add`) owns it now.
+            registry = _get_registry()
+            try:
+                registered_now = registry.get(rid) is not None
+            finally:
+                registry.close()
+            if registered_now:
+                console.print(f"[yellow]Skipped {escape(str(rid))}:[/yellow] registered since the list was read.")
+                continue
             recorded = engine.read_applied_schema(rid) or {}
             engine.delete_repository(rid)
             console.print(f"[green][OK][/green] Deleted: {escape(str(rid))}")
@@ -3806,10 +3904,14 @@ def export(
         None, "--output", "-o", help="File path to write to (default: stdout)."
     ),
     limit: int = typer.Option(
-        500, "--limit", "-n", help="Maximum number of nodes to export."
+        500, "--limit", "-n", help="Maximum number of nodes to export (0 for every node).", min=0
     ),
 ) -> None:
-    """Export graph data for a repository in a portable format."""
+    """Export graph data for a repository in a portable format.
+
+    Every relationship between the exported nodes is included. When the node
+    limit leaves nodes out, a notice on stderr says how many.
+    """
     if fmt not in ("json", "cypher", "dot"):
         console.print("[red][X] Error:[/red] --format must be 'json', 'cypher', or 'dot'")
         raise typer.Exit(code=1)
@@ -3831,7 +3933,7 @@ def export(
         raise typer.Exit(code=1)
 
     try:
-        nodes, edges = dashboard_queries.graph_slice(engine, repo_id, None, limit)
+        nodes, edges, total = dashboard_queries.export_slice(engine, repo_id, limit)
 
         if fmt == "json":
             result = export_json(nodes, edges)
@@ -3844,7 +3946,15 @@ def export(
             Path(output).write_text(result, encoding="utf-8")
             console.print(f"[green][OK][/green] Exported {len(nodes)} nodes, {len(edges)} edges to {escape(output)}")
         else:
-            console.print(escape(result))
+            # Written as is: the console folds long lines at its width (80
+            # columns when stdout is not a terminal), which breaks JSON strings.
+            typer.echo(result)
+        if len(nodes) < total:
+            Console(stderr=True, emoji=False).print(
+                f"[yellow]Exported {escape(str(len(nodes)))} of {escape(str(total))} nodes[/yellow] (the --limit); "
+                "use --limit 0 to export every node.",
+                soft_wrap=True,
+            )
     finally:
         engine.close()
 

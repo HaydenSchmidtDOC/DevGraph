@@ -47,6 +47,9 @@ class StubEngine:
         self.effective_schemas.append(effective)
         self._record(("init_schema",))
 
+    def repository_owner(self, repo_id: str) -> tuple[bool, None]:
+        return False, None  # the graph holds nothing under the new id
+
     def upsert_repository(self, repo_id: str, name: str, path: str) -> None:
         self._record(("upsert_repository", repo_id, name, path))
 

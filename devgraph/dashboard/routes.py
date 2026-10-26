@@ -61,7 +61,14 @@ from devgraph.dashboard.events import CLOSED, EventBroadcaster
 from devgraph.dashboard.git_info import get_git_log, get_git_status
 from devgraph.dashboard.layout_store import load_layout, save_layout
 from devgraph.dashboard.query_log import QueryLog
-from devgraph.graph.engine import EngineClosed, GraphEngine, identity_key, provision_repository_schema
+from devgraph.graph.engine import (
+    EngineClosed,
+    GraphEngine,
+    foreign_graph_data,
+    identity_key,
+    taken_by_another_repository,
+    provision_repository_schema,
+)
 from devgraph.graph.schema import (
     BUILTIN_LABELS,
     INTERNAL_EDGE_PROPERTIES,
@@ -102,6 +109,12 @@ _CANVAS_NODE_PROPERTIES = ("name", "repo_id", "file", "owner", "insight_communit
 # at most what the in-memory ring buffer holds (one hour).
 _HISTORY_SECONDS_MIN = 60
 _HISTORY_SECONDS_MAX = 3600
+# `/query-rate` bounds. A GET needs no cross-site check, so any web page can
+# ask for one; one bucket is allocated per `interval` of `span`. The span is
+# capped at the chart's longest option (a week) and the interval raised so
+# there are never more than this many buckets.
+_QUERY_RATE_SPAN_MAX = 7 * 86400
+_QUERY_RATE_MAX_BUCKETS = 1440
 # One config entry's YAML is a few hundred bytes; 64 KiB leaves room for long
 # Cypher while keeping a hostile body from being buffered or parsed.
 _CONFIG_PAYLOAD_LIMIT_BYTES = 64 * 1024
@@ -162,6 +175,10 @@ def neo4j_down_message(exc: BaseException, uri: str) -> str | None:
         exc = ServiceUnavailable(str(exc))
     error = devgraph_tools.neo4j_unavailable(exc, uri)
     return str(error) if error is not None else None
+
+
+class _ForeignGraphData(Exception):
+    """A new repository's id holds another repository's graph data (`foreign_graph_data`)."""
 
 
 def _reject_cross_site(request: Request) -> None:
@@ -387,8 +404,9 @@ def build_router(
         holds it), so it runs in a threadpool -- the event loop also serves the SSE stream the
         dashboard is watching while this runs.
         """
+        held: list[str] = []
         try:
-            record = registry.add_repo(path, repo_id)
+            record = registry.add_repo(path, repo_id, is_taken=taken_by_another_repository(engine, Path(path).resolve(), held))
         except ValueError as exc:
             # add_repo's own message names the actual problem (missing path,
             # not a git repo, already registered) and contains nothing the
@@ -397,11 +415,19 @@ def build_router(
         except Exception as exc:
             logger.exception("repo registration failed for %s", path)
             raise HTTPException(status_code=500, detail="registration failed") from exc
+        if held:
+            logger.info("registered %s as %s: the graph holds another repository's data under %s, left in place",
+                        record.path, record.repo_id, ", ".join(held))
 
         indexed = False
         files_indexed: int | None = None
         warning: str | None = None
         try:
+            # Registration counts an id it couldn't check (Neo4j slow or down)
+            # as free: never scan into another repository's data.
+            problem = foreign_graph_data(engine, record.repo_id, record.path)
+            if problem:
+                raise _ForeignGraphData(problem)
             provision_repository_schema(engine, record.path)
             engine.upsert_repository(record.repo_id, record.repo_id, str(record.path))
 
@@ -441,6 +467,8 @@ def build_router(
                 # this stamp.
                 files_indexed = run_exclusive(record.repo_id, scan_and_stamp)
                 indexed = True
+        except _ForeignGraphData as exc:
+            warning = f"Registered, but not indexed: {exc}"
         except EngineClosed:
             # The agent is shutting down. Never stamped, so its next start
             # indexes the repository in full.
@@ -873,7 +901,9 @@ def build_router(
 
     @router.get("/query-rate")
     def get_query_rate(span: int = 3600, interval: int = 60) -> dict[str, Any]:
-        return {"buckets": query_log.rate(max(1, span), max(1, interval))}
+        span = max(1, min(span, _QUERY_RATE_SPAN_MAX))
+        interval = max(1, interval, -(-span // _QUERY_RATE_MAX_BUCKETS))
+        return {"buckets": query_log.rate(span, interval)}
 
     def _config_scope(scope: str) -> dict[str, Any]:
         """One Config page block: the global store (`__global__`) or one active registered repo."""

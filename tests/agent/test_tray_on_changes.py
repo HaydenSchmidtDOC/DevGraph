@@ -22,6 +22,7 @@ def tray_app():
         mock_registry = MagicMock()
         mock_registry_cls.return_value = mock_registry
         mock_engine = MagicMock()
+        mock_engine.repository_owner.return_value = (False, None)  # no other repository's data under the id
         mock_engine_cls.return_value = mock_engine
 
         from devgraph.agent.tray import TrayApp

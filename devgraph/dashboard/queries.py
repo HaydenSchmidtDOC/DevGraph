@@ -91,6 +91,34 @@ def graph_slice(
     return node_rows, edge_rows
 
 
+def export_slice(
+    engine: GraphEngine, repo_id: str, limit: int
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+    """Nodes and edges for `devgraph export`, and the repository's node count.
+
+    At most `limit` nodes (every node when `limit` is 0), and every edge
+    between them: unlike `graph_slice`, edges are not capped at the node
+    limit, so a slice never silently loses relationships among its nodes.
+    """
+    nodes = engine.repository_nodes([repo_id])
+    total = engine.run_cypher(nodes + "RETURN count(n) AS count", {"repo_ids": [repo_id]})[0]["count"]
+    node_rows = engine.run_cypher(
+        nodes + "RETURN elementId(n) AS id, labels(n)[0] AS label, n.name AS name, n.file AS file, n.owner AS owner"
+        + (" LIMIT $limit" if limit > 0 else ""),
+        {"repo_ids": [repo_id], "limit": limit},
+    )
+    ids = [row["id"] for row in node_rows]
+    if not ids:
+        return node_rows, [], total
+    edge_rows = engine.run_cypher(
+        "UNWIND $ids AS id MATCH (a)-[r]->(b) WHERE elementId(a) = id AND b.repo_id = $repo_id "
+        "AND elementId(b) IN $ids "
+        "RETURN elementId(a) AS source, elementId(b) AS target, type(r) AS rel_type",
+        {"repo_id": repo_id, "ids": ids},
+    )
+    return node_rows, edge_rows, total
+
+
 def search_components(
     engine: GraphEngine,
     repo_id: str,
@@ -111,12 +139,12 @@ def search_components(
     to the built-in set; the caller must take them from the applied schema
     (never from user input) since a label cannot be parameterized.
     """
-    from devgraph.mcp.tools import _SEARCH_LABELS, _name_variants, ranked_search
+    from devgraph.mcp.tools import _SEARCH_LABELS, SEARCH_MAX_RESULTS, _name_variants, ranked_search
 
     terms = [query.lower()]
     labels = _SEARCH_LABELS + tuple(label for label in project_labels or [] if label not in _SEARCH_LABELS)
     rows, _count, _lower_bound = ranked_search(
-        engine, labels, terms, _name_variants(query, terms), max(1, max_results), repo_id=repo_id,
+        engine, labels, terms, _name_variants(query, terms), max(1, min(max_results, SEARCH_MAX_RESULTS)), repo_id=repo_id,
         query=query,
     )
     return [
@@ -125,18 +153,23 @@ def search_components(
     ]
 
 
-def total_counts(engine: GraphEngine) -> dict[str, Any]:
-    """Aggregate node and relationship counts across all repos.
+def total_counts(engine: GraphEngine, repo_ids: list[str]) -> dict[str, Any]:
+    """Aggregate node and relationship counts across `repo_ids` (the
+    registered repositories): the same shape as summary_counts, summed.
 
-    Returns the same shape as summary_counts but without a repo_id filter.
+    Graph data of ids the registry doesn't hold (a removal that kept its data,
+    another DevGraph registry on the same Neo4j) is not counted.
     """
+    nodes = engine.repository_nodes(repo_ids)
     node_rows = engine.run_cypher(
-        "MATCH (n) UNWIND labels(n) AS label "
-        "RETURN label, count(*) AS count ORDER BY label"
+        nodes + "UNWIND labels(n) AS label "
+        "RETURN label, count(*) AS count ORDER BY label",
+        {"repo_ids": repo_ids},
     )
     rel_rows = engine.run_cypher(
-        "MATCH (a)-[r]->(b) "
-        "RETURN type(r) AS type, count(*) AS count ORDER BY type"
+        nodes + "MATCH (n)-[r]->(b) WHERE b.repo_id = n.repo_id "
+        "RETURN type(r) AS type, count(*) AS count ORDER BY type",
+        {"repo_ids": repo_ids},
     )
     return {
         "nodes_by_label": {row["label"]: row["count"] for row in node_rows},

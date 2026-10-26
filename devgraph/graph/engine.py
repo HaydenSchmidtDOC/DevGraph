@@ -15,7 +15,7 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING, Any
 
 from neo4j import Driver, GraphDatabase, NotificationDisabledClassification, Query, READ_ACCESS, unit_of_work
@@ -2777,6 +2777,39 @@ class GraphEngine:
             )
             return {record["repo_id"] for record in result or []}
 
+    def repository_owner(self, repo_id: str) -> tuple[bool, str | None]:
+        """Whether `repo_id` holds data, and its Repository node's path (None
+        when it has none). Index lookups only: the Repository node through
+        its uniqueness constraint, then each built-in label's named nodes
+        through its `(repo_id, name)` index, so the cost doesn't grow with
+        the database."""
+        with self._driver.session() as session:
+            rows = _run_records(
+                session, "MATCH (r:Repository {repo_id: $repo_id}) RETURN r.path AS path LIMIT 1", repo_id=repo_id
+            )
+            if rows:
+                return True, rows[0]["path"]
+            rows = _run_records(
+                session,
+                _union(
+                    f"MATCH (n:{label}) WHERE n.repo_id = $repo_id AND n.name IS NOT NULL RETURN 1 AS one"
+                    for label in NAMED_LABELS
+                )
+                + "RETURN one LIMIT 1",
+                repo_id=repo_id,
+            )
+            return bool(rows), None
+
+    def repo_node_counts(self, repo_ids: Iterable[str]) -> dict[str, int]:
+        """How many nodes carry each of these repo_ids; an id no node carries is left out."""
+        with self._driver.session() as session:
+            result = _run_records(
+                session,
+                "MATCH (n) WHERE n.repo_id IN $repo_ids RETURN n.repo_id AS repo_id, count(*) AS count",
+                repo_ids=list(repo_ids),
+            )
+            return {record["repo_id"]: record["count"] for record in result or []}
+
     def delete_repository(self, repo_id: str) -> None:
         """Remove every node (and its relationships) scoped to this repo_id."""
         with self._driver.session() as session:
@@ -2994,6 +3027,52 @@ def _graph_shaped(result: Any, max_rows: int | None = None) -> dict[str, Any]:
             }
         )
     return {"columns": columns, "data": data, "truncated": truncated}
+
+
+def taken_by_another_repository(engine: GraphEngine, repo_path: Path | str, held: list[str]) -> Callable[[str], bool]:
+    """`RepoRegistry.add_repo`'s `is_taken` for registering `repo_path`: an id
+    `foreign_graph_data` refuses, each added to `held`. An id that can't be
+    checked (Neo4j slow or down) counts as free: the check before the first
+    scan refuses it then, rather than registration failing."""
+
+    def is_taken(repo_id: str) -> bool:
+        try:
+            taken = foreign_graph_data(engine, repo_id, repo_path) is not None
+        except Exception as exc:  # neo4j driver raises its own exception hierarchy
+            logger.info("could not check the graph for %s before registering it: %s", repo_id, exc)
+            return False
+        if taken:
+            held.append(repo_id)
+        return taken
+
+    return is_taken
+
+
+def foreign_graph_data(engine: GraphEngine, repo_id: str, repo_path: Path | str) -> str | None:
+    """Why `repo_id` must not be registered for, or first scanned from,
+    `repo_path`, else None.
+
+    The graph holding data under `repo_id` whose Repository node names
+    another path, or with no Repository node (whose owner can't be told),
+    is another repository's: another DevGraph install's live one on a shared
+    Neo4j, or one unregistered with `remove --keep-graph`. Registration skips
+    such an id (`RepoRegistry.add_repo`'s `is_taken`), and every first write
+    to a never-indexed repository (registration's own scan, `rescan`, the
+    agent, `index-history`, `annotate --note`) refuses instead of merging
+    into it, since registration may not have been able to look. Data whose
+    Repository node names this same path is this repository's (registered
+    again, or the identical path on another machine sharing the Neo4j, which
+    then shares this graph) and is adopted. Nothing is ever deleted.
+    """
+    held, owner = engine.repository_owner(repo_id)
+    if not held or owner == str(repo_path):
+        return None
+    where = f"a repository at {owner}" if owner else "a repository whose Repository node is gone"
+    return (
+        f"the graph already holds data under {repo_id} from {where}, not {repo_path}; nothing was indexed. "
+        f"Run 'devgraph remove {repo_id} --keep-graph' and register the repository again: it gets a free id, "
+        "and the old data is left in place."
+    )
 
 
 def provision_repository_schema(engine: GraphEngine, repo_root: Path | str) -> None:
