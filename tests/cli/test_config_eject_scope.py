@@ -71,3 +71,36 @@ def test_eject_in_an_unregistered_git_repository_writes_at_its_top_level(setting
     assert result.exit_code == 0, result.output
     assert (top / SCHEMA_FILENAME).exists()
     assert not (sub / SCHEMA_FILENAME).exists()
+
+
+def test_eject_in_a_git_repository_nested_in_a_registered_one_writes_at_the_nested_top_level(
+    settings, repo, monkeypatch
+):
+    import subprocess
+
+    nested = repo / "vendor" / "lib"
+    sub = nested / "src"
+    sub.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=nested, check=True)
+    monkeypatch.chdir(sub)
+    result = CliRunner().invoke(app, ["config", "eject"])
+    assert result.exit_code == 0, result.output
+    assert (nested / SCHEMA_FILENAME).exists()
+    assert not (repo / SCHEMA_FILENAME).exists()
+
+
+def test_eject_without_git_installed_writes_in_the_current_directory(settings, tmp_path, monkeypatch):
+    real_run = cli_main.subprocess.run
+
+    def no_git(cmd, *args, **kwargs):
+        if cmd[0] == "git":
+            raise FileNotFoundError(2, "No such file or directory", "git")
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(cli_main.subprocess, "run", no_git)
+    here = tmp_path / "plain"
+    here.mkdir()
+    monkeypatch.chdir(here)
+    result = CliRunner().invoke(app, ["config", "eject"])
+    assert result.exit_code == 0, result.output
+    assert (here / SCHEMA_FILENAME).exists()

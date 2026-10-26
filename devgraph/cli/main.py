@@ -2603,12 +2603,24 @@ def _default_repo_root() -> tuple[Path, bool]:
     return (_repo_dir(Path(match.path)), True) if match is not None else (cwd, False)
 
 
+def _git_toplevel(directory: Path) -> Path | None:
+    """`git rev-parse --show-toplevel` from `directory`; None outside a git
+    repository or without git installed."""
+    try:
+        top = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"], cwd=str(directory), capture_output=True, text=True,
+        )
+    except OSError:
+        return None
+    return Path(top.stdout.strip()).resolve() if top.returncode == 0 and top.stdout.strip() else None
+
+
 @config_app.command("eject")
 def config_eject(
     repo: Optional[Path] = typer.Option(
         None, "--repo",
-        help="Repository root (default: the registered repository containing the current directory, "
-        "else its git repository's top level, else the current directory).",
+        help="Repository root (default: the git repository containing the current directory when it is "
+        "not registered or nests inside a registered one, else the registered repository, else the current directory).",
     ),
 ) -> None:
     """Write a commented starter devgraph.schema.yaml. Never overwrites an existing file."""
@@ -2618,14 +2630,12 @@ def config_eject(
         root = _repo_dir(repo)
     else:
         root, registered = _default_repo_root()
-        if not registered:
-            # Not yet registered: the git repository's top level, where
-            # registering it will read the file; outside one, here.
-            top = subprocess.run(
-                ["git", "rev-parse", "--show-toplevel"], cwd=str(root), capture_output=True, text=True,
-            )
-            if top.returncode == 0 and top.stdout.strip():
-                root = Path(top.stdout.strip()).resolve()
+        # The git repository containing the current directory, where
+        # registering it will read the file, when no registered repository
+        # contains it or it is a repository nested deeper inside one.
+        top = _git_toplevel(_repo_dir(Path(".")))
+        if top is not None and (not registered or (top != root and is_within(top, root))):
+            root = top
     path = project_schema_path(root)
     try:
         # Exclusive create: also refuses a symlink or a file that appeared
