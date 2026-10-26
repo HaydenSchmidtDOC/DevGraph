@@ -111,7 +111,7 @@ def test_module_recency_spans_the_earliest_and_latest_instants(synced):
 
 def test_history_stored_with_offsets_is_rewritten_in_utc(synced):
     """A graph synced before dates were UTC (no history stamp, offset dates)
-    is re-read in full by the next sync, though HEAD has not moved."""
+    is migrated by the next sync, though HEAD has not moved."""
     engine, registry, repo_id = synced
     expected = engine.run_cypher(
         "MATCH (n {repo_id: $r}) WHERE n:Commit OR n.last_modified_at IS NOT NULL "
@@ -133,7 +133,7 @@ def test_history_stored_with_offsets_is_rewritten_in_utc(synced):
     )
     engine.run_cypher("MATCH (r:Repository {repo_id: $r}) REMOVE r.history_format", {"r": repo_id})
 
-    assert sync_git_history(engine, registry, repo_id)["mode"] == "reconcile"
+    assert sync_git_history(engine, registry, repo_id)["mode"] == "upgraded"
     actual = engine.run_cypher(
         "MATCH (n {repo_id: $r}) WHERE n:Commit OR n.last_modified_at IS NOT NULL "
         "RETURN labels(n) AS l, n.name AS n, n.authored_date AS d, n.created_at AS c, n.last_modified_at AS m "

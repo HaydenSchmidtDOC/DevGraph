@@ -246,7 +246,7 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: `_nest_routes`) and Fastify's `route({ method, url, handler })`; 22:
 #: git commit dates and recency in UTC (git_history `HISTORY_FORMAT` 2, its
 #: own stamp: a full scan writes no history, so the repository's next
-#: history sync rewrites every commit and recency); the docs path and
+#: history sync migrates its stored dates in place); the docs path and
 #: mentions setting a full scan used recorded on the Repository node
 #: (`scan_options_pending`), its mentions Documents deleted with mentions
 #: off and its docs notes with no docs path; docs notes and front matter
