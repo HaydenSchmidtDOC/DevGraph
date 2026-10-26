@@ -268,3 +268,78 @@ def test_the_agent_writes_nothing_for_a_never_indexed_repo_over_another_paths_da
         registry.close()
     assert _names(engine, "Function", name) == []
     assert _repository_path(engine, name) is None
+
+
+@pytest.fixture
+def id_check_fails_once(monkeypatch):
+    """Registration's id check can't reach Neo4j (a timeout, an outage that
+    ends at once); every later check works."""
+    real = GraphEngine.repository_owner
+    calls = []
+
+    def flaky(self, repo_id):
+        calls.append(repo_id)
+        if len(calls) == 1:
+            raise TimeoutError("Neo4j did not answer in time")
+        return real(self, repo_id)
+
+    def unreachable(self, *args, **kwargs):
+        raise TimeoutError("Neo4j did not answer in time")
+
+    monkeypatch.setattr(GraphEngine, "repository_owner", flaky)
+    # A whole-database id read, if registration still made one, fails too.
+    monkeypatch.setattr(GraphEngine, "graph_repo_paths", unreachable, raising=False)
+    return calls
+
+
+def test_add_refuses_to_scan_into_another_paths_data_when_the_id_check_failed(
+    runner, settings, graph, tmp_path, name, id_check_fails_once
+):
+    engine, ids = graph
+    ids.extend([name, f"{name}-2"])
+    _other_repository(engine, name, "/home/other-machine/elsewhere")
+
+    result = runner.invoke(app, ["add", str(_git_repo(tmp_path, name))])
+
+    assert result.exit_code == 1
+    assert "already holds data under" in " ".join(result.stdout.split())
+    assert _registered(settings) == [name]
+    assert _names(engine, "Function", name) == []
+    assert _names(engine, "Commit", name) == ["0ld5ecre7"]
+    assert _repository_path(engine, name) == "/home/other-machine/elsewhere"
+
+
+def test_dashboard_register_refuses_to_scan_into_another_paths_data_when_the_id_check_failed(
+    dashboard, graph, tmp_path, name, id_check_fails_once
+):
+    engine, ids = graph
+    ids.extend([name, f"{name}-2"])
+    _other_repository(engine, name, None)
+
+    res = dashboard.post("/api/repos", json={"path": str(_git_repo(tmp_path, name))})
+
+    assert res.status_code == 201, res.text
+    body = res.json()
+    assert body["repo_id"] == name and body["indexed"] is False
+    assert "already holds data under" in body["warning"]
+    assert _names(engine, "Function", name) == []
+    assert _repository_path(engine, name) is None
+
+
+def test_the_id_check_asks_only_about_each_candidate(tmp_path):
+    """Registration asks about the ids it would issue, one at a time, instead
+    of reading every repo id in the database."""
+    asked = []
+
+    def is_taken(repo_id):
+        asked.append(repo_id)
+        return repo_id == "zz-a10c-lazy"
+
+    repo = tmp_path / "zz-a10c-lazy"
+    (repo / ".git").mkdir(parents=True)
+    registry = RepoRegistry(tmp_path / "lazy.db")
+    try:
+        assert registry.add_repo(repo, is_taken=is_taken).repo_id == "zz-a10c-lazy-2"
+    finally:
+        registry.close()
+    assert asked == ["zz-a10c-lazy", "zz-a10c-lazy-2"]

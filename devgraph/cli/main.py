@@ -37,15 +37,15 @@ from devgraph.dashboard.url import dashboard_url, probe_dashboard
 from devgraph.graph.engine import (
     GraphEngine,
     foreign_graph_data,
-    ids_held_for_other_paths,
     provision_repository_schema,
+    taken_by_another_repository,
 )
 from devgraph.indexer.dispatch import full_scan, full_scan_elsewhere
 from devgraph.indexer.docs.extractor import index_file as index_doc_file
 from devgraph.indexer.git_history.extractor import sync_git_history
 from devgraph.indexer.walk import TOO_LARGE, RepoRootUnavailable, check_repo_root, repo_root_problem
 from devgraph.paths import is_within, is_within_directory, read_bounded, same_directory
-from devgraph.registry.store import RepoRegistry, wanted_repo_id
+from devgraph.registry.store import RepoRegistry
 
 app = typer.Typer(help="DevGraph: local-first developer knowledge graph")
 
@@ -132,23 +132,28 @@ def add(
                 console.print(f"[green][OK][/green] Already registered: {escape(existing.repo_id)} at {escape(str(existing.path))}")
                 return
             settings = get_settings()
-            taken = _ids_held_for_other_paths(settings, resolved)
-            record = registry.add_repo(path, taken=taken)
-            console.print(
-                f"[green][OK][/green] Registered: {escape(record.repo_id)} at {escape(str(record.path))}"
-            )
-            wanted = wanted_repo_id(path)
-            if record.repo_id != wanted and wanted in taken:
-                console.print(
-                    f"[yellow]The graph already holds another repository's data under {escape(wanted)}[/yellow], "
-                    f"so this one is {escape(record.repo_id)}. That data is left in place: if no other DevGraph "
-                    "install on this Neo4j uses it, 'devgraph prune' deletes it.",
-                    soft_wrap=True,
-                )
-
+            engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
             try:
-                engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
+                held: list[str] = []
+                record = registry.add_repo(path, is_taken=taken_by_another_repository(engine, resolved, held))
+                console.print(
+                    f"[green][OK][/green] Registered: {escape(record.repo_id)} at {escape(str(record.path))}"
+                )
+                if held:
+                    console.print(
+                        f"[yellow]The graph already holds another repository's data under "
+                        f"{escape(', '.join(held))}[/yellow], so this one is {escape(record.repo_id)}. That data is "
+                        "left in place: if no other DevGraph install on this Neo4j uses it, 'devgraph prune' deletes it.",
+                        soft_wrap=True,
+                    )
+
                 try:
+                    # Registration counts an id it couldn't check (Neo4j slow
+                    # or down) as free: never scan into another repository's data.
+                    problem = foreign_graph_data(engine, record.repo_id, record.path)
+                    if problem:
+                        console.print(f"[red][X] Error:[/red] {escape(problem)}", soft_wrap=True)
+                        raise typer.Exit(code=1)
                     provision_repository_schema(engine, record.path)
                     engine.upsert_repository(record.repo_id, record.repo_id, str(record.path))
                     started = datetime.now(timezone.utc)
@@ -170,18 +175,20 @@ def add(
                                 f"[yellow]Full scan complete but history indexing failed:[/yellow] {escape(str(e))}\n"
                                 f"  Run 'devgraph index-history {escape(record.repo_id)}' to retry."
                             )
-                finally:
-                    engine.close()
-            except Exception as e:
-                # Registration already succeeded (SQLite committed above) — an
-                # indexing failure (e.g. Neo4j unreachable) shouldn't undo that.
-                # `devgraph rescan <repo_id>` retries the scan once Neo4j is up.
-                console.print(
-                    f"[yellow]Registered but initial scan failed:[/yellow] {escape(_neo4j_problem(e, settings))}\n"
-                    f"  Fix that, then run 'devgraph rescan {escape(record.repo_id)}' to index it.",
-                    soft_wrap=True,
-                )
-                raise typer.Exit(code=1)
+                except typer.Exit:
+                    raise
+                except Exception as e:
+                    # Registration already succeeded (SQLite committed above) — an
+                    # indexing failure (e.g. Neo4j unreachable) shouldn't undo that.
+                    # `devgraph rescan <repo_id>` retries the scan once Neo4j is up.
+                    console.print(
+                        f"[yellow]Registered but initial scan failed:[/yellow] {escape(_neo4j_problem(e, settings))}\n"
+                        f"  Fix that, then run 'devgraph rescan {escape(record.repo_id)}' to index it.",
+                        soft_wrap=True,
+                    )
+                    raise typer.Exit(code=1)
+            finally:
+                engine.close()
         finally:
             registry.close()
     except typer.Exit:
@@ -192,21 +199,6 @@ def add(
     except Exception as e:
         console.print(f"[red][X] Unexpected error:[/red] {escape(str(e))}")
         raise typer.Exit(code=1)
-
-
-def _ids_held_for_other_paths(settings: Any, path: Path) -> set[str]:
-    """The ids registering `path` must skip (`ids_held_for_other_paths`); none
-    when Neo4j can't be asked, and the first rescan or index checks instead
-    (`foreign_graph_data`)."""
-    engine = None
-    try:
-        engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
-        return ids_held_for_other_paths(engine, path)
-    except Exception:
-        return set()
-    finally:
-        if engine is not None:
-            engine.close()
 
 
 #: How many skipped files `_print_skipped` names before summarising the rest.

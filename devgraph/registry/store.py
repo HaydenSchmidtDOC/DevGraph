@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 import sqlite3
 import threading
-from collections.abc import Collection
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -67,11 +67,6 @@ _SLUG_RE = re.compile(r"[^a-z0-9_-]+")
 # lookup (the Config page's global store, the canvas's "All Repos"): never
 # issued as a repo id, so a repository can't be shadowed by one.
 RESERVED_REPO_IDS = frozenset({"__global__", "__all__"})
-
-
-def wanted_repo_id(path: str | Path, repo_id: str | None = None) -> str:
-    """The id `add_repo` issues when nothing holds it yet."""
-    return _slugify(repo_id or Path(path).resolve().name)
 
 
 def _slugify(name: str) -> str:
@@ -195,10 +190,13 @@ class RepoRegistry:
         except OSError:
             return None
 
-    def add_repo(self, path: str | Path, repo_id: str | None = None, taken: Collection[str] = ()) -> RepoRecord:
+    def add_repo(
+        self, path: str | Path, repo_id: str | None = None, is_taken: Callable[[str], bool] | None = None
+    ) -> RepoRecord:
         """Register `path` under `repo_id` (default: its folder name), slugified;
-        an id already registered, reserved or in `taken` (ids the graph holds
-        another repository's data under) gets the next free `-2`, `-3`, ... suffix."""
+        an id already registered, reserved or `is_taken` (the graph holds
+        another repository's data under it) gets the next free `-2`, `-3`, ... suffix.
+        `is_taken` is asked about each candidate in turn, so a free id costs one call."""
         resolved = Path(path).resolve()
         if not resolved.exists() or not resolved.is_dir():
             raise ValueError(f"path does not exist or is not a directory: {resolved}")
@@ -214,9 +212,9 @@ class RepoRegistry:
             candidate = _slugify(repo_id or resolved.name)
             final_id = candidate
             suffix = 2
-            while final_id in RESERVED_REPO_IDS or final_id in taken or self._conn.execute(
+            while final_id in RESERVED_REPO_IDS or self._conn.execute(
                 "SELECT 1 FROM repos WHERE repo_id = ?", (final_id,)
-            ).fetchone():
+            ).fetchone() or (is_taken is not None and is_taken(final_id)):
                 final_id = f"{candidate}-{suffix}"
                 suffix += 1
 

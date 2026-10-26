@@ -64,8 +64,9 @@ from devgraph.dashboard.query_log import QueryLog
 from devgraph.graph.engine import (
     EngineClosed,
     GraphEngine,
+    foreign_graph_data,
     identity_key,
-    ids_held_for_other_paths,
+    taken_by_another_repository,
     provision_repository_schema,
 )
 from devgraph.graph.schema import (
@@ -77,7 +78,7 @@ from devgraph.graph.schema import (
 from devgraph.indexer.dispatch import full_scan, full_scan_running
 from devgraph.indexer.walk import repo_root_problem
 from devgraph.mcp import tools as devgraph_tools
-from devgraph.registry.store import RepoRegistry, wanted_repo_id
+from devgraph.registry.store import RepoRegistry
 from devgraph.watcher.manager import is_partly_watched
 
 logger = logging.getLogger(__name__)
@@ -174,6 +175,10 @@ def neo4j_down_message(exc: BaseException, uri: str) -> str | None:
         exc = ServiceUnavailable(str(exc))
     error = devgraph_tools.neo4j_unavailable(exc, uri)
     return str(error) if error is not None else None
+
+
+class _ForeignGraphData(Exception):
+    """A new repository's id holds another repository's graph data (`foreign_graph_data`)."""
 
 
 def _reject_cross_site(request: Request) -> None:
@@ -399,15 +404,9 @@ def build_router(
         holds it), so it runs in a threadpool -- the event loop also serves the SSE stream the
         dashboard is watching while this runs.
         """
+        held: list[str] = []
         try:
-            # Never an id the graph holds another repository's data under
-            # (`ids_held_for_other_paths`); with Neo4j down nothing can be
-            # checked here, and the first scan checks (`foreign_graph_data`).
-            taken = ids_held_for_other_paths(engine, Path(path).resolve())
-        except Exception:
-            taken = set()
-        try:
-            record = registry.add_repo(path, repo_id, taken=taken)
+            record = registry.add_repo(path, repo_id, is_taken=taken_by_another_repository(engine, Path(path).resolve(), held))
         except ValueError as exc:
             # add_repo's own message names the actual problem (missing path,
             # not a git repo, already registered) and contains nothing the
@@ -416,15 +415,19 @@ def build_router(
         except Exception as exc:
             logger.exception("repo registration failed for %s", path)
             raise HTTPException(status_code=500, detail="registration failed") from exc
-        wanted = wanted_repo_id(path, repo_id)
-        if record.repo_id != wanted and wanted in taken:
+        if held:
             logger.info("registered %s as %s: the graph holds another repository's data under %s, left in place",
-                        record.path, record.repo_id, wanted)
+                        record.path, record.repo_id, ", ".join(held))
 
         indexed = False
         files_indexed: int | None = None
         warning: str | None = None
         try:
+            # Registration counts an id it couldn't check (Neo4j slow or down)
+            # as free: never scan into another repository's data.
+            problem = foreign_graph_data(engine, record.repo_id, record.path)
+            if problem:
+                raise _ForeignGraphData(problem)
             provision_repository_schema(engine, record.path)
             engine.upsert_repository(record.repo_id, record.repo_id, str(record.path))
 
@@ -464,6 +467,8 @@ def build_router(
                 # this stamp.
                 files_indexed = run_exclusive(record.repo_id, scan_and_stamp)
                 indexed = True
+        except _ForeignGraphData as exc:
+            warning = f"Registered, but not indexed: {exc}"
         except EngineClosed:
             # The agent is shutting down. Never stamped, so its next start
             # indexes the repository in full.
