@@ -39,7 +39,7 @@ from devgraph.indexer.dispatch import full_scan, full_scan_elsewhere
 from devgraph.indexer.docs.extractor import index_file as index_doc_file
 from devgraph.indexer.git_history.extractor import sync_git_history
 from devgraph.indexer.walk import TOO_LARGE, RepoRootUnavailable, check_repo_root, repo_root_problem
-from devgraph.paths import is_within, read_bounded
+from devgraph.paths import is_within, is_within_directory, read_bounded, same_directory
 from devgraph.registry.store import RepoRegistry
 
 app = typer.Typer(help="DevGraph: local-first developer knowledge graph")
@@ -569,10 +569,10 @@ def tray_stop() -> None:
     Every connected MCP client's server process holds a "hold" on the tray
     (see devgraph/agent/lifecycle.py) so a single client disconnecting
     doesn't stop indexing for the others — this command overrides that and
-    stops it outright, clearing all recorded holders in the process.
+    stops it outright. The holds are kept: 'devgraph update' stops and
+    starts the agent under sessions that stay open and never register again.
     """
     pid = lifecycle.read_tray_pid()
-    lifecycle.clear_tray_holders()
     if pid is None:
         console.print("[yellow]Tray app is not running[/yellow] (no live agent on record)")
         return
@@ -966,7 +966,7 @@ def _registered_repo_id(root: Path) -> str:
     registry = _get_registry()
     try:
         for repo in registry.list_repos():
-            if Path(repo.path).expanduser().resolve() == target:
+            if same_directory(Path(repo.path).expanduser().resolve(), target):
                 return repo.repo_id
     finally:
         registry.close()
@@ -2489,7 +2489,7 @@ def _containing_repo(repos: list[Any], target: Path) -> Any | None:
     best = None
     for repo in repos:
         root = Path(repo.path).expanduser().resolve()
-        if target == root or target.is_relative_to(root):
+        if is_within_directory(target, root):
             if best is None or len(root.parts) > len(Path(best.path).expanduser().resolve().parts):
                 best = repo
     return best
@@ -2849,7 +2849,7 @@ def _tools_scope(
 
 def _scope_record(root: Path):
     """The registry record for the repository at `root` (active or not), else None."""
-    return next((r for r in _registered_repos() if Path(r.path).expanduser().resolve() == root), None)
+    return next((r for r in _registered_repos() if same_directory(Path(r.path).expanduser().resolve(), root)), None)
 
 
 def _tools_scope_note(root: Path | None) -> str:

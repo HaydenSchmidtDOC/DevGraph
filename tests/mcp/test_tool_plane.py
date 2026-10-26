@@ -114,6 +114,24 @@ def test_cwd_picks_the_deepest_registered_repo(tmp_path):
     assert resolve_session_repo(registry, {}, tmp_path) == (None, "none")
 
 
+def test_cwd_typed_in_another_case_finds_the_repo_on_macos(tmp_path, monkeypatch):
+    """macOS ignores case and its resolve() keeps the case typed, so a
+    working directory of .../shop/src lies in a repository registered as .../Shop."""
+    from types import SimpleNamespace
+
+    from devgraph import paths
+
+    shop = Repo("shop", tmp_path / "Shop")
+    shop.path.mkdir()
+    monkeypatch.setattr(paths, "sys", SimpleNamespace(platform="darwin"))
+    monkeypatch.setattr(paths.os.path, "samefile", lambda a, b: str(a).casefold() == str(b).casefold())
+    registry = Registry([shop])
+    assert resolve_session_repo(registry, {}, tmp_path / "shop" / "src") == (shop, "cwd")
+    assert resolve_session_repo(registry, {}, tmp_path / "shopping") == (None, "none")
+    monkeypatch.setattr(paths, "sys", SimpleNamespace(platform="linux"))  # case counts elsewhere
+    assert resolve_session_repo(registry, {}, tmp_path / "shop" / "src") == (None, "none")
+
+
 # ── serving ────────────────────────────────────────────────────────────────
 
 

@@ -38,7 +38,7 @@ from devgraph.config.project_tools import (
 )
 from devgraph.config.yaml_bound import bounded_safe_load
 from devgraph.mcp.catalog import builtin_tool_names, scoped_tool_id
-from devgraph.paths import is_within, read_bounded
+from devgraph.paths import is_within, is_within_directory, read_bounded
 
 from mcp.server.mcpserver.exceptions import ToolError
 from neo4j import time as neo4j_time
@@ -66,7 +66,7 @@ def _deepest_containing(repos: list[Any], target: Path) -> Any | None:
         if not Path(repo.path).is_absolute():  # would resolve against the working directory
             continue
         root = _resolved(repo.path)
-        if target == root or target.is_relative_to(root):
+        if is_within_directory(target, root):
             depth = len(root.parts)
             if depth > best_depth:
                 best, best_depth = repo, depth
