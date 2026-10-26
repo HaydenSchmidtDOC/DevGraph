@@ -214,7 +214,9 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: shows an Endpoint of its own file (`unmounted_endpoint`); and a compose
 #: service's build context resolved from the compose file's folder, the
 #: repository root (`build: .` at the root, `context: ..` one level down)
-#: owning every file no deeper context claims.
+#: owning every file no deeper context claims; and JS/TS calls inside an
+#: anonymous callback (`useEffect(() => ...)`, an `onClick` arrow, `.then`)
+#: attributed to the named function holding it (jsts `_call_functions`).
 #: An index stamped lower, or not at all, is rescanned automatically.
 INDEX_FORMAT = 20
 

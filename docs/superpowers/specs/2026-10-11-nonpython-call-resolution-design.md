@@ -355,7 +355,7 @@ Since index format 18:
   inline render prop, a `useCallback` body, nested ones) renders from the
   named function holding it (`_call_functions`), unless its tag names a
   parameter of a callback holding it (`items.map(Comp => <Comp />)`).
-  Calls there are still attributed to no one. A function is named when
+  Calls there are attributed to no one (until index format 20, below). A function is named when
   it is a declarator's or a class field's value (`_named_function`); its
   elements are its own.
 - A class component (`class Modal extends React.Component`) renders
@@ -424,6 +424,21 @@ a block had no node and their calls were attributed to no one (an
 The fuzz's `op_ts_service` adds and removes such a service (`svc`, with a
 nested object and a function declared in an `if`) in a TS file, which
 others call as `svc.run()`.
+
+**Calls inside callbacks** (index format 20, audit 8 item 2). A call inside
+an anonymous function (`useEffect(() => fetchOrder(id))`, `onClick={() =>
+save()}`, `.then(o => track(o))`, `xs.forEach(function (x) { ... })`, an
+inline Express handler) was attributed to no one, unlike a Python lambda's,
+a Go closure's or a Java, Kotlin, C#, Rust or C++ lambda's. `_call_functions`
+now keeps them for the named function (or Module) holding the callback, as
+it does the callback's JSX elements. A callback's parameters, destructured
+ones included, shadow there like a block's locals (`_block_names`), so
+`items.map(fn => fn())` links no function `fn`; a `const`/`let` in its body
+shadows inside it. A `function` expression (not an arrow) binds its own
+`this` (`_in_function_expression`), so `this.m()` there is not pinned to
+the class. A named nested function (`_named_function`) keeps its own calls.
+The call-graph fixtures list no call inside a callback, so their measures
+are unchanged.
 
 ## Kotlin parse recovery (`devgraph/indexer/kotlin/extractor.py`)
 

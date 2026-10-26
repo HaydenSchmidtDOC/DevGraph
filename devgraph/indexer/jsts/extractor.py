@@ -452,11 +452,14 @@ def _local_names(body: Node) -> set[str]:
 def _block_names(site: Node, body: Node) -> set[str]:
     """The names the blocks between `site` and its function's `body` bind
     for it: each enclosing block's `const`/`let`, a `for (const W of ...)`
-    or `for (let i = ...)` head's, a `catch (W)` parameter's."""
+    or `for (let i = ...)` head's, a `catch (W)` parameter's, an enclosing
+    anonymous callback's parameters (`_call_functions`)."""
     found: set[bytes] = set()
     child, node = site, site.parent
     while node is not None and node != body:
-        if node.type == "statement_block":
+        if node.type in _FUNCTION_VALUE_TYPES:
+            found |= _bound_names(node)
+        elif node.type == "statement_block":
             for statement in node.named_children:
                 if statement.type == "lexical_declaration":
                     found |= _declared_names(statement)
@@ -472,6 +475,17 @@ def _block_names(site: Node, body: Node) -> set[str]:
     return _decode(found)
 
 
+def _in_function_expression(site: Node, body: Node) -> bool:
+    """Whether a `function` expression (not an arrow) between `site` and its
+    function's `body` holds it."""
+    node = site.parent
+    while node is not None and node != body:
+        if node.type in ("function_expression", "generator_function"):
+            return True
+        node = node.parent
+    return False
+
+
 def _call_functions(body: Node) -> list[Node]:
     """The `function` node of every call expression in `body`, and the name
     of every JSX element rendering a component (`_jsx_component`), not
@@ -479,11 +493,13 @@ def _call_functions(body: Node) -> list[Node]:
     separately so calls are attributed to the correct enclosing scope rather
     than hoisted to the outer function (mirrors the Python extractor's
     `_call_functions`). An anonymous function (a callback, `items.map(i =>
-    <Row />)`, an inline render prop; not one `_named_function` makes a
-    Function of its own) is walked for its JSX elements only, which render
-    from the enclosing function, unless their tag names a parameter of a
-    callback holding them. `require(...)` is module-system syntax, captured
-    by `_extract_imports`."""
+    <Row />)`, `useEffect(() => ...)`, an `onClick` arrow, an inline render
+    prop; not one `_named_function` makes a Function of its own) is walked
+    too: its calls and JSX elements are the enclosing function's, as a
+    Python lambda's are, and a callback's parameters and locals shadow there
+    (`_block_names`); a JSX tag naming a callback's parameter is skipped
+    here. `require(...)` is module-system syntax, captured by
+    `_extract_imports`."""
     found: list[Node] = []
 
     def walk(node: Node, shadowed: frozenset[bytes] | None) -> None:
@@ -491,7 +507,7 @@ def _call_functions(body: Node) -> list[Node]:
             if node.type not in _FUNCTION_VALUE_TYPES or _named_function(node):
                 return
             shadowed = (shadowed or frozenset()) | _bound_names(node)
-        if node.type == "call_expression" and shadowed is None:
+        if node.type == "call_expression":
             func = node.child_by_field_name("function")
             if func is not None and not (func.type == "identifier" and func.text == b"require"):
                 found.append(func)
@@ -1712,9 +1728,11 @@ def extract_js_file(
         by_name = calls.setdefault((caller_label, caller_name, caller_owner), {})
         for func in _call_functions(body):
             jsx = func.parent is not None and func.parent.type in _JSX_TAGS
-            # A block's own locals shadow there only.
+            # A block's own locals shadow there only; a callback's `function`
+            # binds a `this` of its own, never the class's.
             block = _block_names(func, body)
-            site = _Scope(scope.cls, scope.params | block, scope.types) if block else scope
+            cls = None if _in_function_expression(func, body) else scope.cls
+            site = _Scope(cls, scope.params | block, scope.types) if block or cls != scope.cls else scope
             # A class component renders through its `render`, which its class owns.
             rendered = [("render", pin, False) for pin in resolver.render_pins(func, site)] if jsx else []
             for name, pin, member in resolver.resolve(func, site) + rendered:
