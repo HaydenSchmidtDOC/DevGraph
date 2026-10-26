@@ -226,9 +226,12 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: language; and a Django class-based view's route (`View.as_view()`, DRF's
 #: `APIView.as_view()` and a ViewSet's `as_view({...})`) IMPLEMENTS its
 #: Class and the request-handling methods of it (apis/extractor.py
-#: `_django_implements`), not a Function of the class's name.
+#: `_django_implements`), not a Function of the class's name; 21: gin and
+#: echo group routes with an empty or relative path (`users.GET("", h)`),
+#: and chi's and fiber's `Mount` of a router a same-file function returns
+#: or a variable holds, its routes under the mount's prefix.
 #: An index stamped lower, or not at all, is rescanned automatically.
-INDEX_FORMAT = 20
+INDEX_FORMAT = 21
 
 
 def index_outdated(engine: GraphEngine, repo_id: str) -> bool:

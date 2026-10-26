@@ -731,7 +731,13 @@ def _go_routes(
     `PathPrefix("/x").Subrouter()` or chi `Route("/x", func(r chi.Router)
     {...})` of a known router adds its prefix; a router package's group or
     router type (a parameter, a field), or anything else, is a router
-    mounted where the file doesn't show (`unmounted_endpoint`). The
+    mounted where the file doesn't show (`unmounted_endpoint`). A chi or
+    fiber `r.Mount("/x", sub())` of a same-file function returning a
+    router (or of a variable holding one) puts that router's routes under
+    its prefix; one mounted at two places, or an imported one, keeps its
+    own. On a router or group a path need not start with "/" (gin's and
+    echo's `users.GET("", h)` is the group's own path); on anything else
+    it must. The
     handler resolves as a call to it would (`http.HandlerFunc(h)` is `h`); a
     function literal implements nothing."""
     imports = _extract_imports(root, source)
@@ -864,6 +870,12 @@ def _go_routes(
             args = node.child_by_field_name("arguments")
             first = args.named_children[0] if args is not None and args.named_children else None
             return under(kind(func.child_by_field_name("operand"), node, depth + 1), _go_literal(first, source))
+        found_kind = value_kind(node, depth)
+        mount = mounts.get((node.start_byte, node.end_byte))
+        return mount if mount is not None and found_kind == ("root", "") else found_kind
+
+    def value_kind(node: Node, depth: int) -> tuple[str, str | None]:
+        """What a receiver's declared value is (see `kind`)."""
         if node.type == "unary_expression":
             node = node.child_by_field_name("operand") or node
         if node.type in ("identifier", "selector_expression"):
@@ -893,6 +905,62 @@ def _go_routes(
         if field == "With":
             return kind(operand, node, depth + 1)  # chi: the same router with middleware
         return ("none", None)
+
+    functions = {
+        _text(name, source): each for each in root.named_children
+        if each.type == "function_declaration" and (name := each.child_by_field_name("name")) is not None
+    }
+
+    def mounted_values(arg: Node, at: Node) -> list[Node]:
+        """The declared values of the router a `Mount` argument stands for:
+        a variable's, or each variable a same-file function returns."""
+        if arg.type == "identifier":
+            found = declaration(_text(arg, source), at)
+            if found is None or found[0] != "value":
+                return []
+            arg = found[1]
+        func = arg.child_by_field_name("function") if arg.type == "call_expression" else None
+        if func is None or func.type != "identifier" or _text(func, source) not in functions:
+            return [arg] if arg.type == "call_expression" else []
+        function = functions[_text(func, source)]
+        values = []
+        for ret in _descendants(function, "return_statement"):
+            owner = ret.parent
+            while owner is not None and owner.type not in _FUNCTION_NODES:
+                owner = owner.parent
+            returned = ret.named_children[0].named_children if ret.named_children and (
+                ret.named_children[0].type == "expression_list") else ret.named_children
+            if owner == function and len(returned) == 1 and returned[0].type == "identifier":
+                found = declaration(_text(returned[0], source), ret)
+                if found is not None and found[0] == "value":
+                    values.append(found[1])
+        return values
+
+    # chi's and fiber's `r.Mount("/admin", adminRouter())`: the router a
+    # same-file function returns, or a variable holds, is under the mount's
+    # prefix (declared value -> where; None when mounted at two places).
+    # Settled over as many passes as mounts, for a mount in a mounted router.
+    mounts: dict[tuple[int, int], tuple[str, str | None] | None] = {}
+    mount_calls = []
+    for call in _descendants(root, "call_expression"):
+        func = call.child_by_field_name("function")
+        args = call.child_by_field_name("arguments")
+        values = [a for a in args.named_children if a.type != "comment"] if args is not None else []
+        if func is not None and func.type == "selector_expression" and len(values) == 2 and (
+            _text(func.child_by_field_name("field"), source) == "Mount"
+        ):
+            mount_calls.append((call, func.child_by_field_name("operand"), values))
+    for _pass in range(len(mount_calls)):
+        settled: dict[tuple[int, int], tuple[str, str | None] | None] = {}
+        for call, operand, (prefix, router) in mount_calls:
+            where = under(kind(operand, call), _go_literal(prefix, source))
+            for value in mounted_values(router, call):
+                span = (value.start_byte, value.end_byte)
+                settled[span] = where if settled.get(span, where) == where else None
+        if settled == mounts:
+            break
+        mounts.clear()
+        mounts.update(settled)
 
     def is_function(handler: Node, scope: dict) -> bool:
         """Whether a handler is surely a function or method: one of the
@@ -941,7 +1009,7 @@ def _go_routes(
                     methods = sorted(set(verbs))
         elif field not in _PATTERN_CALLS and first is not None:
             methods, path, handlers = ["*" if field == "Any" else field.upper()], first, values[1:]
-        if methods is None or not path.startswith("/") or not handlers or any(
+        if methods is None or (pattern and not path) or not handlers or any(
             _go_literal(each, source) is not None for each in handlers
         ) or handlers[-1].type not in ("identifier", "selector_expression", "func_literal", "call_expression"):
             continue  # not a route: `client.Post("/x", "text/plain", body)`, `cache.Get("/k", &v)`
@@ -951,8 +1019,8 @@ def _go_routes(
             if wrapper is not None and _text(wrapper, source).endswith("HandlerFunc") and len(wrapped.named_children) == 1:
                 handler = wrapped.named_children[0]  # http.HandlerFunc(h)
         receiver = kind(operand, call) if operand is not None else ("root", "")
-        if receiver[0] == "skip":
-            continue  # a dynamic prefix
+        if receiver[0] == "skip" or (receiver[0] == "none" and not path.startswith("/")):
+            continue  # a dynamic prefix; `store.Get("key", v)`
         if field not in _PATTERN_CALLS and receiver[0] == "none" and (
             not is_function(handler, scope) or (
                 operand.type == "identifier" and _text(operand, source) in resolver.bindings
