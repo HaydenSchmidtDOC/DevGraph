@@ -2608,13 +2608,26 @@ def _default_repo_root() -> tuple[Path, bool]:
 def config_eject(
     repo: Optional[Path] = typer.Option(
         None, "--repo",
-        help="Repository root (default: the registered repository containing the current directory, else it).",
+        help="Repository root (default: the registered repository containing the current directory, "
+        "else its git repository's top level, else the current directory).",
     ),
 ) -> None:
     """Write a commented starter devgraph.schema.yaml. Never overwrites an existing file."""
     from devgraph.config.project_schema import project_schema_path, starter_schema_text
 
-    path = project_schema_path(_repo_dir(repo) if repo is not None else _default_repo_root()[0])
+    if repo is not None:
+        root = _repo_dir(repo)
+    else:
+        root, registered = _default_repo_root()
+        if not registered:
+            # Not yet registered: the git repository's top level, where
+            # registering it will read the file; outside one, here.
+            top = subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"], cwd=str(root), capture_output=True, text=True,
+            )
+            if top.returncode == 0 and top.stdout.strip():
+                root = Path(top.stdout.strip()).resolve()
+    path = project_schema_path(root)
     try:
         # Exclusive create: also refuses a symlink or a file that appeared
         # after any check we could have made.

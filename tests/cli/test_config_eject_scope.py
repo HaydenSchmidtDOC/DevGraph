@@ -57,3 +57,17 @@ def test_eject_with_repo_writes_there(settings, repo, tmp_path, monkeypatch):
     result = CliRunner().invoke(app, ["config", "eject", "--repo", str(repo)])
     assert result.exit_code == 0, result.output
     assert (repo / SCHEMA_FILENAME).exists()
+
+
+def test_eject_in_an_unregistered_git_repository_writes_at_its_top_level(settings, tmp_path, monkeypatch):
+    import subprocess
+
+    top = tmp_path / "unregistered"
+    sub = top / "src" / "pkg"
+    sub.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=top, check=True)
+    monkeypatch.chdir(sub)
+    result = CliRunner().invoke(app, ["config", "eject"])
+    assert result.exit_code == 0, result.output
+    assert (top / SCHEMA_FILENAME).exists()
+    assert not (sub / SCHEMA_FILENAME).exists()
