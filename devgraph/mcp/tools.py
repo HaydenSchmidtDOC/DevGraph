@@ -958,13 +958,20 @@ def _resolve_targets(
     in use that are no built-in one (`_undeclared_targets`), so a node whose label
     the repository does not declare (any more) is still found, and its label is
     added to the returned ones. `describe` False skips building the envelope.
-    `owner` keeps only the nodes of that owner (`_OWNER_MATCH`).
+    `owner` keeps only the nodes of that owner (`_OWNER_MATCH`). A route's
+    handler stub that folds into a real Function (`_fold_target`,
+    `_shadowed_stub`) is left out, as search and describe_node leave it out.
 
     Raises:
         ToolError: no node has that name (of `owner`), or none of them is in `file`.
     """
     params = {"name": name, "owner": owner, **({} if cross_repo else {"repo_id": repo_id})}
-    rows = _query(engine, _named_nodes(labels, "name", cross_repo) + f"WITH n WHERE {_OWNER_MATCH} " + _TARGETS_RETURN, params)
+    # A route's handler stub that stands for real Functions is no target of its own.
+    hidden = f"{_fold_target('n')}WITH n, folded WHERE folded IS NULL AND NOT {_shadowed_stub('n')} "
+    rows = _query(
+        engine, _named_nodes(labels, "name", cross_repo) + f"WITH n WHERE {_OWNER_MATCH} " + hidden + _TARGETS_RETURN,
+        params,
+    )
     if not rows and owner is not None:
         where = "any repository" if cross_repo else f"repository {_echo(repo_id)}"
         raise ToolError(

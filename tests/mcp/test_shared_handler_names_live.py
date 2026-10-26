@@ -126,3 +126,12 @@ def test_a_stub_some_route_left_unresolved_stays_visible(engine, repo_id):
     assert [(c["name"], c["file"]) for c in users["components"] if c["name"] == "create"] == [
         ("create", "src/main/java/shop/UsersController.java")
     ]
+
+
+@pytest.mark.parametrize("tool", [tools.find_callers, tools.impact_analysis])
+def test_ambiguous_targets_leave_the_folded_stub_out(engine, repo_id, tool):
+    ambiguous = tool(engine, repo_id, "list")["ambiguous_targets"]
+    assert ambiguous["count"] == 3
+    assert sorted(r["file"] for r in ambiguous["results"]) == [
+        f"src/main/java/shop/{n.title()}Controller.java" for n in sorted(CONTROLLERS)
+    ]
