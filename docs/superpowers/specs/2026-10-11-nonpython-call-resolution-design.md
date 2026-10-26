@@ -355,7 +355,7 @@ Since index format 18:
   inline render prop, a `useCallback` body, nested ones) renders from the
   named function holding it (`_call_functions`), unless its tag names a
   parameter of a callback holding it (`items.map(Comp => <Comp />)`).
-  Calls there are still attributed to no one. A function is named when
+  Calls there are attributed to no one (until index format 20, below). A function is named when
   it is a declarator's or a class field's value (`_named_function`); its
   elements are its own.
 - A class component (`class Modal extends React.Component`) renders
@@ -424,6 +424,24 @@ a block had no node and their calls were attributed to no one (an
 The fuzz's `op_ts_service` adds and removes such a service (`svc`, with a
 nested object and a function declared in an `if`) in a TS file, which
 others call as `svc.run()`.
+
+**Calls inside callbacks** (index format 20, audit 8 item 2). A call inside
+an anonymous function (`useEffect(() => fetchOrder(id))`, `onClick={() =>
+save()}`, `.then(o => track(o))`, `xs.forEach(function (x) { ... })`, an
+inline Express handler) was attributed to no one, unlike a Python lambda's,
+a Go closure's or a Java, Kotlin, C#, Rust or C++ lambda's. `_call_functions`
+now keeps them for the named function (or Module) holding the callback, as
+it does the callback's JSX elements. A callback's parameters, destructured
+ones included, shadow there like a block's locals (`_block_names`), so
+`items.map(fn => fn())` links no function `fn`; a `const`/`let` in its body
+shadows inside it. A `function` expression (not an arrow) binds its own
+`this` (`_in_function_expression`), so `this.m()` there is not pinned to
+the class. A named nested function (`_named_function`) keeps its own calls.
+A method of an object literal `_object_path` does not define
+(`configure({ onDone() { ... } })`, `export default { methods: {...} }`)
+is walked the same way (`_anonymous_function`), binding its own `this`.
+The call-graph fixtures list no call inside a callback, so their measures
+are unchanged.
 
 ## Kotlin parse recovery (`devgraph/indexer/kotlin/extractor.py`)
 
@@ -1283,6 +1301,28 @@ edge are functions of the file's text and the compose files. The fuzz
 toggles clients' imports in Python, TS, Java, Kotlin, C# and Go files
 (`op_datastore`); `tests/indexer/test_client_datastores_live.py` scans one
 service per language. C++ and Rust clients are not read.
+
+**Python from the syntax tree** (index format 20, audit 8 item 3). The
+Python `DatastoreExtractor` was a regular expression over the whole file:
+`import\s+(\S+)` matched by prefix (`redistricting` was Redis), and
+`postgresql://`, `pymysql`, `MongoClient(` and the like anywhere in the
+text, a comment, a docstring or the extractor's own tables, made a store,
+and a test folder was not skipped (DevGraph's own repository had 13
+stores, two real). It now walks the Tree-sitter Python tree: an
+`import`/`from ... import` of a client module (`DATASTORE_LIBRARY_MAP`: the
+module itself or one below it, `redis.asyncio`; never a relative import;
+`pymysql` for MySQL), a known client call on a real call node
+(`CLIENT_CALLS`: `psycopg2.connect(...)`, `redis.Redis(...)`), and a
+connection URL that is a call's argument, positional or keyword
+(`create_engine("postgresql://...")`, the schemes above, and for every
+language SQLAlchemy's `dialect+driver` form, `postgresql+asyncpg://`); an
+f-string counts by its literal start (`f"postgresql://{host}/db"`), an
+implicit concatenation not at all. A file under a test folder (`TEST_DIR`) names
+none, and its node per provider takes the alphabetically first library, as
+the other languages' do. Both dispatcher call sites (`_datastore_nodes`,
+`_owning_service_relationships`) go through it.
+`tests/indexer/test_python_datastores_syntax.py` and
+`test_python_datastores_live.py`.
 
 ## Express routers mounted from another file (index format 18)
 

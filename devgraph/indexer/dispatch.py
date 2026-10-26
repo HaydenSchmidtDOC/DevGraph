@@ -214,11 +214,19 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: shows an Endpoint of its own file (`unmounted_endpoint`); a compose
 #: service's build context resolved from the compose file's folder, the
 #: repository root (`build: .` at the root, `context: ..` one level down)
-#: owning every file no deeper context claims; and a Django class-based view's
-#: route (`View.as_view()`, DRF's `APIView.as_view()` and a ViewSet's
-#: `as_view({...})`) IMPLEMENTS its Class and the request-handling methods
-#: of it (apis/extractor.py `_django_implements`), not a Function of the
-#: class's name.
+#: owning every file no deeper context claims; JS/TS calls inside an
+#: anonymous callback (`useEffect(() => ...)`, an `onClick` arrow, `.then`,
+#: an unnamed object literal's method) attributed to the named function
+#: holding it (jsts `_call_functions`); Python datastores read from the
+#: syntax tree (an import of a client module or one below it, a known
+#: client call, a URL passed to a call, an f-string's by its literal start;
+#: no comment, docstring or other string, no test folder, one node per
+#: provider; datastores/extractor.py `DatastoreExtractor`), and a
+#: `dialect+driver` connection URL (`postgresql+asyncpg://`) in every
+#: language; and a Django class-based view's route (`View.as_view()`, DRF's
+#: `APIView.as_view()` and a ViewSet's `as_view({...})`) IMPLEMENTS its
+#: Class and the request-handling methods of it (apis/extractor.py
+#: `_django_implements`), not a Function of the class's name.
 #: An index stamped lower, or not at all, is rescanned automatically.
 INDEX_FORMAT = 20
 
