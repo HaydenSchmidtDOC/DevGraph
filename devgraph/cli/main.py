@@ -2577,12 +2577,15 @@ def _default_repo_root() -> tuple[Path, bool]:
 
 @config_app.command("eject")
 def config_eject(
-    repo: Path = typer.Option(Path("."), "--repo", help="Repository root (default: current directory)."),
+    repo: Optional[Path] = typer.Option(
+        None, "--repo",
+        help="Repository root (default: the registered repository containing the current directory, else it).",
+    ),
 ) -> None:
     """Write a commented starter devgraph.schema.yaml. Never overwrites an existing file."""
     from devgraph.config.project_schema import project_schema_path, starter_schema_text
 
-    path = project_schema_path(_repo_dir(repo))
+    path = project_schema_path(_repo_dir(repo) if repo is not None else _default_repo_root()[0])
     try:
         # Exclusive create: also refuses a symlink or a file that appeared
         # after any check we could have made.
