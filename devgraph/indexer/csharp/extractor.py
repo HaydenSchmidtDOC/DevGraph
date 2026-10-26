@@ -1107,6 +1107,28 @@ def _route_attributes(node: Node, source: bytes) -> dict[str, list[str | None]]:
     return found
 
 
+def _map_methods(node: Node, source: bytes) -> list[str]:
+    """`MapMethods`' methods argument as its HTTP methods: an array or
+    collection of string literals or `HttpMethods.X`; none when any item is
+    something else (a variable)."""
+    if node.type in ("array_creation_expression", "implicit_array_creation_expression"):
+        node = next((c for c in node.named_children if c.type == "initializer_expression"), node)
+    if node.type == "element_binding_expression":  # `["GET"]`, as the grammar reads a collection expression
+        items = [arg.named_children[-1] for arg in node.named_children if arg.type == "argument"]
+    elif node.type in ("initializer_expression", "collection_expression"):
+        items = node.named_children
+    else:
+        return []
+    methods = []
+    for item in items:
+        name = item.child_by_field_name("name") if item.type == "member_access_expression" else None
+        literal = _string_literal(item, source)
+        if literal is None and (name is None or _text(item.child_by_field_name("expression"), source) != "HttpMethods"):
+            return []
+        methods.append((literal if literal is not None else _text(name, source)).upper())
+    return sorted(set(methods))
+
+
 #: Minimal-API receivers: an app (a root), or a route builder a caller
 #: passes, mounted under a prefix the file doesn't show.
 _ROOT_BUILDER_TYPES = frozenset({"WebApplication"})
@@ -1122,7 +1144,8 @@ def _aspnet_routes(
     name) `[HttpGet("x")]`/`[Route("x")]` actions under each of its
     `[Route]`s, the `[controller]` and `[action]` tokens filled in (any
     case), implemented by the action, owned by its class. Minimal APIs:
-    `app.MapGet("/x", handler)`, implemented by the method of the file it
+    `app.MapGet("/x", handler)` (`MapMethods("/x", new[] {"GET"}, h)` one
+    route per method), implemented by the method of the file it
     names, else by what a call to it reaches (`TodoHandlers.GetById` in
     another file, by its class's keys); a lambda implements nothing. The receiver is followed to its
     nearest declaration before the call in its scope (then the enclosing
@@ -1263,6 +1286,10 @@ def _aspnet_routes(
         receiver, method = func.child_by_field_name("expression"), func.child_by_field_name("name")
         values = [arg.named_children[-1] for arg in arguments.named_children if arg.type == "argument"]
         verb = _MAP_CALLS.get(_text(method, source)) if method is not None else None
+        verbs = [verb]
+        if method is not None and _text(method, source) == "MapMethods" and len(values) == 3:
+            verbs, values = _map_methods(values[1], source), [values[0], values[2]]
+            verb = "" if verbs else None
         if receiver is None or verb is None or len(values) < 2:
             continue
         path = _string_literal(values[0], source)
@@ -1285,18 +1312,20 @@ def _aspnet_routes(
                 handler = handler.child_by_field_name("name")
             name = _text(handler, source)
             owners = {o for o in functions.get(name, ()) if qualifier is None or o.rsplit(".", 1)[-1] == qualifier}
-            if len(owners) == 1:
-                add_route(result, repo_id, file_path, "ASP.NET Core", verb, full, name, next(iter(owners)),
-                          mounted=mounted)
-            else:
-                # As a call to it would resolve (`TodoHandlers.GetById()`), into another file too.
-                calls = _CsCalls(resolver, _enclosing_classes(call, source), {}, resolver.scope(call))
-                calls.callee(values[1])
-                pins = next((each for callee, each, _member in calls.found if callee == name and each), ())
-                add_route(result, repo_id, file_path, "ASP.NET Core", verb, full, name, pins=set(pins),
-                          mounted=mounted)
+            for verb in verbs:
+                if len(owners) == 1:
+                    add_route(result, repo_id, file_path, "ASP.NET Core", verb, full, name, next(iter(owners)),
+                              mounted=mounted)
+                else:
+                    # As a call to it would resolve (`TodoHandlers.GetById()`), into another file too.
+                    calls = _CsCalls(resolver, _enclosing_classes(call, source), {}, resolver.scope(call))
+                    calls.callee(values[1])
+                    pins = next((each for callee, each, _member in calls.found if callee == name and each), ())
+                    add_route(result, repo_id, file_path, "ASP.NET Core", verb, full, name, pins=set(pins),
+                              mounted=mounted)
         else:
-            add_route(result, repo_id, file_path, "ASP.NET Core", verb, full, mounted=mounted)
+            for verb in verbs:
+                add_route(result, repo_id, file_path, "ASP.NET Core", verb, full, mounted=mounted)
 
 
 def extract_csharp_file(

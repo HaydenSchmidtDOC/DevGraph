@@ -231,7 +231,8 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: and chi's and fiber's `Mount` of a router a same-file function returns
 #: or a variable holds, its routes under the mount's prefix; C# top-level
 #: statements' local functions as top-level Functions, and a minimal-API
-#: handler resolved as a call to it (another file's class's method).
+#: handler resolved as a call to it (another file's class's method), and
+#: ASP.NET `MapMethods` routes.
 #: An index stamped lower, or not at all, is rescanned automatically.
 INDEX_FORMAT = 21
 
