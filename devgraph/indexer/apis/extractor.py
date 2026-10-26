@@ -575,7 +575,10 @@ class APIExtractor:
             fulls = sorted(path if above == "" else join_python_route(above, path) for above in aboves)
             if not aboves:
                 # Mounted where the file doesn't show: under its own prefix (none when not a literal).
-                full = join_python_route(routes.own.get(receiver) or "", path)
+                # With neither, `""` stays "" (`GET ? (file)`), apart from `"/"`: under a mount's
+                # "/items" one is "/items", the other "/items/".
+                under_own = routes.own.get(receiver) or ""
+                full = join_python_route(under_own, path) if under_own or path else ""
                 own = unmounted_endpoint(method, full, filename)
                 if exports := routes.exports(receiver):
                     deferred.setdefault(own, set()).update(
