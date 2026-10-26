@@ -326,6 +326,38 @@ def test_dashboard_register_refuses_to_scan_into_another_paths_data_when_the_id_
     assert _repository_path(engine, name) is None
 
 
+def test_index_history_refuses_a_never_indexed_repo_over_another_paths_data(runner, settings, graph, tmp_path, name):
+    engine, ids = graph
+    ids.append(name)
+    _other_repository(engine, name, "/home/other-machine/elsewhere")
+    repo = _git_repo(tmp_path, name)
+    subprocess.run(["git", "-c", "user.name=Example Dev", "-c", "user.email=dev@example.com",
+                    "commit", "-q", "--allow-empty", "-m", "mine"], cwd=repo, check=True)
+    _registered_while_neo4j_was_down(settings, repo)
+
+    result = runner.invoke(app, ["index-history", name])
+
+    assert result.exit_code == 1
+    assert "already holds data under" in " ".join(result.stdout.split())
+    assert _names(engine, "Commit", name) == ["0ld5ecre7"]
+
+
+def test_annotate_note_refuses_a_never_indexed_repo_over_another_paths_data(runner, settings, graph, tmp_path, name):
+    engine, ids = graph
+    ids.append(name)
+    _other_repository(engine, name, "/home/other-machine/elsewhere")
+    repo = _git_repo(tmp_path, name)
+    (repo / "req.md").write_text("---\ntype: requirement\nid: REQ-1\ntitle: Mine\n---\nBody\n", encoding="utf-8")
+    _registered_while_neo4j_was_down(settings, repo)
+
+    result = runner.invoke(app, ["annotate", name, "--note", "req.md"])
+
+    assert result.exit_code == 1
+    assert "already holds data under" in " ".join(result.stdout.split())
+    rows = engine.run_cypher("MATCH (n {repo_id: $r}) RETURN DISTINCT labels(n)[0] AS label", {"r": name})
+    assert sorted(row["label"] for row in rows) == ["Commit", "Repository"]
+
+
 def test_the_id_check_asks_only_about_each_candidate(tmp_path):
     """Registration asks about the ids it would issue, one at a time, instead
     of reading every repo id in the database."""

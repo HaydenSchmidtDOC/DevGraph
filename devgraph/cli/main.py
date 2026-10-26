@@ -201,6 +201,16 @@ def add(
         raise typer.Exit(code=1)
 
 
+def _refuse_foreign_graph_data(engine: GraphEngine, repo: Any) -> None:
+    """Exit 1 before the first write to a never-indexed repository whose id
+    holds another repository's graph data (`foreign_graph_data`): it was
+    registered while that couldn't be checked, and is never merged into it."""
+    problem = None if repo.last_indexed else foreign_graph_data(engine, repo.repo_id, repo.path)
+    if problem:
+        console.print(f"[red][X] Error:[/red] {escape(problem)}", soft_wrap=True)
+        raise typer.Exit(code=1)
+
+
 #: How many skipped files `_print_skipped` names before summarising the rest.
 _SKIPPED_SHOWN = 20
 
@@ -406,12 +416,7 @@ def rescan(
             settings = get_settings()
             engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
             try:
-                # Registered while Neo4j was down, so its id was never checked
-                # against the graph: never merge into another repository's data.
-                problem = None if repo.last_indexed else foreign_graph_data(engine, repo_id, repo.path)
-                if problem:
-                    console.print(f"[red][X] Error:[/red] {escape(problem)}", soft_wrap=True)
-                    raise typer.Exit(code=1)
+                _refuse_foreign_graph_data(engine, repo)
                 provision_repository_schema(engine, repo.path)
                 engine.upsert_repository(repo_id, repo_id, str(repo.path))
                 holder = full_scan_elsewhere(engine, repo_id)
@@ -670,6 +675,7 @@ def annotate(
                     settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password
                 )
                 try:
+                    _refuse_foreign_graph_data(engine, repo)
                     engine.init_schema()
                     index_doc_file(engine, repo_id, note_path, repo.path)
                     console.print(f"[green][OK][/green] Indexed note: {escape(note)}")
@@ -716,6 +722,7 @@ def index_history(
             settings = get_settings()
             engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
             try:
+                _refuse_foreign_graph_data(engine, repo)
                 engine.init_schema()
                 result = sync_git_history(engine, registry, repo_id, max_count=max_count)
                 console.print(f"[green][OK][/green] Indexed {result['commits_indexed']} new commit(s) for {escape(repo_id)}")
