@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import textwrap
 from dataclasses import dataclass
 from pathlib import Path
@@ -128,8 +129,9 @@ def test_cwd_typed_in_another_case_finds_the_repo_on_macos(tmp_path, monkeypatch
     registry = Registry([shop])
     assert resolve_session_repo(registry, {}, tmp_path / "shop" / "src") == (shop, "cwd")
     assert resolve_session_repo(registry, {}, tmp_path / "shopping") == (None, "none")
-    monkeypatch.setattr(paths, "sys", SimpleNamespace(platform="linux"))  # case counts elsewhere
-    assert resolve_session_repo(registry, {}, tmp_path / "shop" / "src") == (None, "none")
+    if os.name != "nt":  # Windows paths ignore case whatever the platform says
+        monkeypatch.setattr(paths, "sys", SimpleNamespace(platform="linux"))  # case counts elsewhere
+        assert resolve_session_repo(registry, {}, tmp_path / "shop" / "src") == (None, "none")
 
 
 # ── serving ────────────────────────────────────────────────────────────────

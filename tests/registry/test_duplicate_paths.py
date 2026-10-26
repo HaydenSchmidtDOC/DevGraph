@@ -17,7 +17,7 @@ def registry(tmp_path):
 
 def _git_dir(tmp_path, name):
     root = tmp_path / name
-    (root / ".git").mkdir(parents=True)
+    (root / ".git").mkdir(parents=True, exist_ok=True)  # one folder on Windows
     return root
 
 
