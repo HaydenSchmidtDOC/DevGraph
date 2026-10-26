@@ -109,6 +109,14 @@ _ROUTER_NAMES = frozenset({"app", "router"})
 _OWN_PREFIX = {"APIRouter": "prefix", "Blueprint": "url_prefix"}
 #: The calls mounting a router on an app or router: (framework, the keyword giving the mount's prefix).
 _MOUNT_CALLS = {"include_router": ("FastAPI", "prefix"), "register_blueprint": ("Flask", "url_prefix")}
+#: The calls adding a route to an app or router: Flask's `add_url_rule(rule,
+#: endpoint, view_func)` and FastAPI's `add_api_route(path, endpoint)`, with
+#: (framework, the path's keyword, the view's keyword, the view's position).
+_RULE_CALLS = {
+    "add_url_rule": ("Flask", "rule", "view_func", 2), "add_api_route": ("FastAPI", "path", "endpoint", 1),
+}
+#: A Flask class-based view's bases that give it no HTTP method handler.
+_VIEW_BASES = frozenset({"MethodView", "View", "object"})
 #: The suffix of a Flask blueprint's export name for a mount that replaces
 #: its own `url_prefix` (`register_blueprint(bp, url_prefix=...)`): Flask
 #: puts the blueprint's routes under that prefix instead of its own, where
@@ -177,8 +185,9 @@ def _methods(value: Node | None, source: bytes) -> list[str]:
 
 
 class _Routes:
-    """One Python file's routes, read from its syntax tree: decorators and
-    URL-pattern calls only, never a comment or a string."""
+    """One Python file's routes, read from its syntax tree: decorators,
+    `add_url_rule`/`add_api_route` and URL-pattern calls only, never a
+    comment or a string."""
 
     def __init__(self, root: Node, source: bytes):
         self.source = source
@@ -194,6 +203,9 @@ class _Routes:
         self.calls: list[Node] = []
         self.local: dict[str, list[tuple[str, str, str | None]]] = {}  # router -> its (mounted on, framework, prefix)
         self.classes: set[str] = set()  # the file's top-level classes
+        self.functions: set[str] = set()  # the file's top-level functions
+        self.class_methods: dict[str, set[str]] = {}  # top-level class -> the methods it defines
+        self.class_bases: dict[str, list[str]] = {}  # top-level class -> its bases as written
         # Iterative, in source order: a deeply nested expression (3,000 `+`
         # terms) is read on any thread's stack.
         pending: list[tuple[Node, str, str | None, str]] = [(root, "Module", None, "")]
@@ -251,6 +263,15 @@ class _Routes:
             name_node = node.child_by_field_name("name")
             if name_node is not None and node.type == "class_definition" and label == "Module":
                 self.classes.add(_text(name_node, source))
+                bases = node.child_by_field_name("superclasses")
+                self.class_bases[_text(name_node, source)] = [
+                    _text(base, source) for base in (bases.named_children if bases is not None else [])
+                    if base.type in ("identifier", "attribute")
+                ]
+            elif name_node is not None and label == "Module":
+                self.functions.add(_text(name_node, source))
+            elif name_node is not None and label == "Class" and not owner and name in self.classes:
+                self.class_methods.setdefault(name, set()).add(_text(name_node, source))
             if name_node is not None:
                 owner = member_owner(label, name, owner)
                 label = "Class" if node.type == "class_definition" else "Function"
@@ -298,6 +319,48 @@ class _Routes:
             )
             found += [(framework, method, path, handler, owner, receiver_text) for method in methods]
         return found
+
+    def rule_calls(self) -> list[tuple[str, list[str] | None, str, Node, str]]:
+        """(framework, its methods, path, view, receiver) per `add_url_rule`
+        and `add_api_route` call on an app or router (`_routing`) whose path
+        is a literal and that gives a view; the methods are `methods=`'s
+        (`_methods`), None when not given."""
+        found = []
+        for call in self.calls:
+            func = call.child_by_field_name("function")
+            if func is None or func.type != "attribute":
+                continue
+            obj, attr = func.child_by_field_name("object"), func.child_by_field_name("attribute")
+            if obj is None or attr is None or _text(attr, self.source) not in _RULE_CALLS:
+                continue
+            framework, path_keyword, view_keyword, at = _RULE_CALLS[_text(attr, self.source)]
+            receiver = _text(obj, self.source)
+            positional, keywords = _arguments(call)
+            path = _literal(positional[0] if positional else keywords.get(path_keyword), self.source)
+            view = keywords.get(view_keyword) or (positional[at] if len(positional) > at else None)
+            if path is None or view is None or not self._routing(receiver):
+                continue
+            given = keywords.get("methods")
+            found.append((framework, None if given is None else _methods(given, self.source), path, view, receiver))
+        return found
+
+    def view_methods(self, cls: str, seen: frozenset = frozenset()) -> tuple[str, ...] | None:
+        """The HTTP method handlers (`get`, `post`, ...) a top-level class
+        of the file defines or inherits from classes of the file, as a
+        Flask `MethodView` routes them; None when it is no class of the
+        file or a base of it is another file's (its methods are not known
+        here)."""
+        if cls not in self.classes or cls in seen:
+            return None
+        found = self.class_methods.get(cls, set()) & set(_HTTP_METHOD_HANDLERS)
+        for base in self.class_bases.get(cls, ()):
+            if base.rsplit(".", 1)[-1] in _VIEW_BASES:
+                continue
+            inherited = self.view_methods(base, seen | {cls})
+            if inherited is None:
+                return None
+            found |= set(inherited)
+        return tuple(method for method in _HTTP_METHOD_HANDLERS if method in found)
 
     def mount_calls(self) -> list[tuple[str, str, str | None, Node]]:
         """(framework, the app or router mounted on, the prefix, the router
@@ -502,6 +565,50 @@ def _django_implements(
     ]
 
 
+def _rule_views(view: Node, methods: list[str] | None, routes: _Routes, bindings, filename: str, source: bytes):
+    """(method, handler, its IMPLEMENTS edges from an Endpoint) per route of
+    an `add_url_rule`/`add_api_route` view (`_Routes.rule_calls`).
+
+    A function of the file is that file's, as a decorated handler is; any
+    other name links where `_django_implements` finds it (its imported
+    module's). A class-based view's `as_view(...)` (Flask's `MethodView`)
+    is its Class and, per method, the method's handler (`get` for GET);
+    with no `methods=` its methods are the HTTP method handlers the class
+    has (`_Routes.view_methods`), or for a class whose methods aren't
+    known here (another file's) one "*" route linking every HTTP method
+    handler of it, as a Django class-based view's does. Any other view
+    (a lambda) is no route."""
+    class_view = False
+    if view.type == "call":  # `UserAPI.as_view("user_api")`
+        inner = view.child_by_field_name("function")
+        view = inner.child_by_field_name("object") if inner is not None and inner.type == "attribute" else None
+        if view is None or not _text(inner, source).endswith(".as_view"):
+            return []
+        if methods is None:
+            known = routes.view_methods(_text(view, source))
+            methods = [method.upper() for method in known] if known else ["*"]
+        class_view = True
+    if view.type not in ("identifier", "attribute"):
+        return []
+    written = _text(view, source)
+    if not class_view and view.type == "identifier" and written in routes.functions:
+        return [
+            (method, written, lambda endpoint: _pinned_implements(endpoint, written, filename, ""))
+            for method in methods or ["GET"]
+        ]
+
+    def link(endpoint: str, method: str) -> tuple[str, list[Relationship]]:
+        linked = None if not class_view else _HTTP_METHOD_HANDLERS if method == "*" else (method.lower(),)
+        return _django_implements(
+            endpoint, written.rsplit(".", 1)[-1], written, bindings, linked, filename, routes.classes,
+        )
+
+    name = link("", "*")[0]
+    return [
+        (method, name, lambda endpoint, method=method: link(endpoint, method)[1]) for method in methods or ["GET"]
+    ]
+
+
 class APIExtractor:
     """Extracts API endpoints and their handlers from Python source code."""
 
@@ -523,7 +630,8 @@ class APIExtractor:
         decorator is FastAPI's or Flask's by the app or router it is on (the
         call that made it, else the framework the file imports): a FastAPI
         `@app.post` is POST alone, and Flask's `methods=[...]` gives each
-        method listed.
+        method listed. Flask's `add_url_rule` and FastAPI's `add_api_route`
+        calls on an app or router are routes too (`_rule_views`).
 
         A router's routes are under its own literal prefix (`APIRouter(
         prefix=...)`, `Blueprint(url_prefix=...)`) and those of the mounts
@@ -563,14 +671,26 @@ class APIExtractor:
             else:
                 foreign.append((framework, parent, prefix, router))
         django = routes.django_routes()
-        bindings = _extract_imports(root, source, filename, roots) if django or foreign else None
+        rules = routes.rule_calls()
+        bindings = _extract_imports(root, source, filename, roots) if django or foreign or rules else None
+        # (framework, method, path, receiver, handler, its IMPLEMENTS edges from an Endpoint)
+        found = [
+            (framework, method, path, receiver, handler,
+             lambda endpoint, handler=handler, owner=owner: _pinned_implements(endpoint, handler, filename, owner))
+            for framework, method, path, handler, owner, receiver in routes.decorator_routes()
+        ]
+        for framework, methods, path, view, receiver in rules:
+            found += [
+                (framework, method, path, receiver, handler, link)
+                for method, handler, link in _rule_views(view, methods, routes, bindings, filename, source)
+            ]
         # A route on a router the file mounts on no app is the file's own
         # (`unmounted_endpoint`); one of a router another module can import
         # is also a `route_exports` entry, unless another unmounted route of
         # the file shares its Endpoint.
         deferred: dict[str, set[str]] = {}
         kept: set[str] = set()
-        for framework, method, path, handler, owner, receiver in routes.decorator_routes():
+        for framework, method, path, receiver, handler, link in found:
             aboves = routes.prefixes(receiver)
             fulls = sorted(path if above == "" else join_python_route(above, path) for above in aboves)
             if not aboves:
@@ -592,7 +712,7 @@ class APIExtractor:
                 fulls = [full]
             for full in fulls:
                 endpoint = self._add(result, framework, method, full, handler, filename, "handler", bool(aboves))
-                result.relationships.extend(_pinned_implements(endpoint, handler, filename, owner))
+                result.relationships.extend(link(endpoint))
         result.route_exports = sorted(
             entry for own, entries in deferred.items() if own not in kept for entry in entries
         ) or None

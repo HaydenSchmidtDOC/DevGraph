@@ -229,7 +229,10 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: `_django_implements`), not a Function of the class's name; 21: an
 #: unprefixed Python router's `""` and `"/"` routes apart (`GET ? (file)`
 #: and `GET ?/ (file)` until a mount names them), and an Express route
-#: with an empty path (`router.get('', h)`, its router's mount).
+#: with an empty path (`router.get('', h)`, its router's mount); Flask
+#: `add_url_rule` (a `MethodView.as_view` view IMPLEMENTS its Class and its
+#: HTTP method handlers) and FastAPI `add_api_route` routes
+#: (apis/extractor.py `_rule_views`).
 #: An index stamped lower, or not at all, is rescanned automatically.
 INDEX_FORMAT = 21
 
