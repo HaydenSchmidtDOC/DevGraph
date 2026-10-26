@@ -729,7 +729,8 @@ def _go_routes(
     its function (then the enclosing ones, then the file's): a router
     package's constructor is a root router; a literal `Group("/x")`,
     `PathPrefix("/x").Subrouter()` or chi `Route("/x", func(r chi.Router)
-    {...})` of a known router adds its prefix; a router package's group or
+    {...})` of a known router adds its prefix (chi's `Group(func(r
+    chi.Router) {...})` keeps its router's); a router package's group or
     router type (a parameter, a field), or anything else, is a router
     mounted where the file doesn't show (`unmounted_endpoint`). A chi or
     fiber `r.Mount("/x", sub())` of a same-file function returning a
@@ -769,7 +770,7 @@ def _go_routes(
     def declaration(name: str, at: Node) -> tuple[str, Node] | None:
         """The nearest declaration of `name` before `at`: ("value", its
         value), ("type", its declared type) or ("route", the chi `Route`
-        call whose function literal declares it)."""
+        or `Group` call whose function literal declares it)."""
         node = at.parent
         while node is not None:
             if node.type in _FUNCTION_NODES:
@@ -804,7 +805,7 @@ def _go_routes(
                             func = outer.child_by_field_name("function") if outer is not None and (
                                 outer.type == "call_expression") else None
                             if node.type == "func_literal" and func is not None and func.type == "selector_expression" \
-                                    and _text(func.child_by_field_name("field"), source) == "Route":
+                                    and _text(func.child_by_field_name("field"), source) in ("Route", "Group"):
                                 return ("route", outer)
                             declared = param.child_by_field_name("type")
                             return ("type", declared) if declared is not None else None
@@ -867,6 +868,8 @@ def _go_routes(
             return type_kind(node)
         if how == "route":
             func = node.child_by_field_name("function")
+            if _text(func.child_by_field_name("field"), source) == "Group":
+                return kind(func.child_by_field_name("operand"), node, depth + 1)  # chi: the same prefix
             args = node.child_by_field_name("arguments")
             first = args.named_children[0] if args is not None and args.named_children else None
             return under(kind(func.child_by_field_name("operand"), node, depth + 1), _go_literal(first, source))
