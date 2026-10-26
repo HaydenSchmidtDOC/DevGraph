@@ -161,8 +161,9 @@ def test_routes_reach_the_architecture_tools(engine, repo_id, tmp_path, framewor
     assert [entry["calls"] for entry in endpoints] == ["shop"]
     assert endpoint in endpoints[0]["endpoints"]
     flow = trace_request_flow(engine, repo_id, endpoint)
-    assert {"name": handler, "labels": ["Function"], "repo_id": repo_id} in flow["components"]
-    assert {"name": "shop", "labels": ["Service"], "repo_id": repo_id} in flow["components"]
+    listed = [{k: c[k] for k in ("name", "labels", "repo_id")} for c in flow["components"]]
+    assert {"name": handler, "labels": ["Function"], "repo_id": repo_id} in listed
+    assert {"name": "shop", "labels": ["Service"], "repo_id": repo_id} in listed
     # The handler's own Function, and the file-less stub.
     assert _handlers(engine, repo_id, endpoint) == [("", handler), (handler_file, handler)]
 

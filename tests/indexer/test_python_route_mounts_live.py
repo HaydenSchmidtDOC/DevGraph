@@ -126,8 +126,8 @@ def test_include_router_across_files_and_its_edits(engine, repo_id, tmp_path):
     ]
     assert all(row["mounted"] and row["services"] == ["shop"] for row in listed)
     flow = trace_request_flow(engine, repo_id, "GET /api/orders/{order_id}")
-    assert {"name": "get_order", "labels": ["Function"], "repo_id": repo_id} in flow[
-        "components"
+    assert ("get_order", ["Function"], repo_id) in [
+        (c["name"], c["labels"], c["repo_id"]) for c in flow["components"]
     ]
     calls = explain_architecture(engine, repo_id)["endpoints"]["results"]
     assert sorted(calls[0]["endpoints"]) == [

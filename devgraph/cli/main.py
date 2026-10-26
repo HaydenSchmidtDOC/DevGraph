@@ -932,30 +932,53 @@ def _print_dashboard_status(settings) -> None:
         console.print(f"  [yellow]not serving[/yellow] at {escape(url)} (it runs inside the agent: 'devgraph tray start')")
 
 
+def _pending_rescans(engine: GraphEngine, repos: list[Any]) -> list[Any]:
+    """The active, indexed `repos` whose graph index predates the current
+    format (or is gone: a wiped graph), and so await a rescan. A never-indexed
+    repo's first scan (add/rescan) stamps the format."""
+    from devgraph.indexer.dispatch import index_outdated
+
+    return [r for r in repos if r.active and r.last_indexed and index_outdated(engine, r.repo_id)]
+
+
+def _rescan_hint(repo: Any) -> str:
+    # The agent's automatic upgrade skips repositories it does not watch.
+    if repo.watch_enabled:
+        return "(the agent rescans it automatically, or run 'devgraph rescan')"
+    return "(not watched: run 'devgraph rescan')"
+
+
+def _index_state(engine: GraphEngine, repo_id: str) -> str:
+    """Why a repository's graph index awaits a rescan (`_pending_rescans`): its
+    recorded format is older than the current one; it records none (an index
+    from before formats were stamped); or it is gone (a wiped graph)."""
+    from devgraph.indexer.dispatch import INDEX_FORMAT
+
+    found = engine.index_format(repo_id)
+    if found is not None:
+        return f"index format {found} < {INDEX_FORMAT}"
+    rows = engine.run_cypher(
+        "MATCH (r:Repository {repo_id: $repo_id}) RETURN count(r) > 0 AS present", {"repo_id": repo_id}
+    )
+    return "no index format recorded" if rows and rows[0]["present"] else "no index in the graph"
+
+
 def _print_graph_index(engine: GraphEngine) -> None:
     """The `status` "Graph Index" section: active, indexed repositories whose
     index predates the current format and so await an automatic rescan."""
-    from devgraph.indexer.dispatch import index_outdated
-
     console.print("[bold]Graph Index[/bold]")
     try:
         registry = _get_registry()
         try:
-            repos = [r for r in registry.list_repos() if r.active]
+            repos = registry.list_repos()
         finally:
             registry.close()
-        # A never-indexed repo's first scan (add/rescan) stamps the format.
-        pending = [r for r in repos if r.last_indexed and index_outdated(engine, r.repo_id)]
+        pending = _pending_rescans(engine, repos)
     except Exception as e:
         console.print(f"  [red]Error:[/red] {escape(str(e))}")
         return
     for repo in pending:
-        console.print(f"  [yellow]{escape(repo.repo_id)}: rescan pending[/yellow] ", end="")
-        # The agent's automatic upgrade skips repositories it does not watch.
-        if repo.watch_enabled:
-            console.print("(the agent rescans it automatically, or run 'devgraph rescan')")
-        else:
-            console.print("(not watched: run 'devgraph rescan')")
+        console.print(f"  [yellow]{escape(repo.repo_id)}: rescan pending[/yellow] {_rescan_hint(repo)}")
     if not pending:
         console.print("  up to date")
 
@@ -1219,7 +1242,9 @@ def doctor(
     importability, Neo4j reachability + schema, Podman container state, the
     repo registry, each registered repository's folder (present and
     readable), each repository's optional `devgraph.schema.yaml`, graph data
-    of unregistered repositories, and tray liveness — continuing past
+    of unregistered repositories, each indexed repository's graph index (a
+    wiped or outdated one awaits a rescan, and doctor then says so instead of
+    "All checks passed"), and tray liveness — continuing past
     non-fatal failures so one run surfaces everything at once. Intended for bootstrap/troubleshooting moments;
     `status` stays the fast/lightweight command for quick glances.
     """
@@ -1557,6 +1582,35 @@ def doctor(
                 soft_wrap=True,
             )
 
+    # 7f. Each indexed repository's graph index: wiped, or older than the
+    # current format, it answers from nothing or from outdated extraction
+    # until rescanned (`status` says so too). Needs the graph.
+    console.print("[bold]Graph index[/bold]")
+    pending_rescans: list[Any] = []
+    if not neo4j_reachable:
+        console.print("  [yellow]skipped[/yellow]: Neo4j is not reachable")
+    else:
+        from devgraph.indexer.dispatch import INDEX_FORMAT
+
+        index_engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
+        try:
+            pending_rescans = _pending_rescans(index_engine, present_repos)
+            states = {repo.repo_id: _index_state(index_engine, repo.repo_id) for repo in pending_rescans}
+        except Exception as e:
+            pending_rescans, states = [], None
+            console.print(f"  [yellow][!][/yellow] could not check: {escape(str(e))}")
+        finally:
+            index_engine.close()
+        if states == {}:
+            current = f"every indexed repository is at index format {INDEX_FORMAT}"
+            console.print(f"  [green][OK][/green] {escape(current if present_repos else nothing_to_check)}")
+        for repo in pending_rescans:
+            state = escape(states[repo.repo_id])
+            console.print(
+                f"  [yellow][!] {escape(repo.repo_id)}:[/yellow] {state}, rescan pending {_rescan_hint(repo)}",
+                soft_wrap=True,
+            )
+
     # 8. Tray/watcher liveness
     console.print("[bold]Live Watcher[/bold]")
     liveness = _tray_liveness_text(settings)
@@ -1575,6 +1629,13 @@ def doctor(
     if any_failed:
         console.print("[red]doctor found one or more failing checks above.[/red]")
         raise typer.Exit(code=1)
+    if pending_rescans:
+        count = len(pending_rescans)
+        console.print(
+            f"[yellow]No failing checks, but {count} {'repository awaits' if count == 1 else 'repositories await'} "
+            "a rescan (see Graph index above).[/yellow]"
+        )
+        return
     console.print("[green]All checks passed.[/green]")
 
 

@@ -740,10 +740,12 @@ def build_server(
         """Trace the request flow from an endpoint through services, datastores, and queues
         (every node within five hops). start_endpoint is an endpoint name like
         "GET /users/<id>", or a bare path like "/users/<id>" to start from that path's
-        endpoint for every method. A route's handler stub is listed as the one real
-        function it stands for (whose calls are followed too), or as itself when it
-        stands for none; edges are {type, from, to} between listed components. An
-        unknown endpoint is an error with similar names."""
+        endpoint for every method (a Django route with or without its path's leading
+        "/"). A route's handler stub is listed as the one real
+        function it stands for (the traced route's own when routes share a handler
+        name; its calls are followed too), or as itself when it stands for none. Each
+        component is {name, labels, repo_id, file, owner}; edges are {type, from, to}
+        between listed components. An unknown endpoint is an error with similar names."""
         return devgraph_tools.trace_request_flow(engine, repo_id, start_endpoint, cross_repo)
 
     @server.tool(annotations=_READ_ONLY)
@@ -786,7 +788,9 @@ def build_server(
         "A.run" / "A::run". Callers in test code (under tests/, test/, __tests__/,
         src/test/, or a test file such as test_*.py, *_test.go, *.spec.ts, *Test.java)
         come after all others; test_count says how many there are, and
-        include_tests=false leaves them out."""
+        include_tests=false leaves them out. An API route reaches its handler by
+        IMPLEMENTS, not a call: routed_by lists the target's endpoints apart, a
+        {count, results, truncated} envelope of rows as list_endpoints gives them."""
         return devgraph_tools.find_callers(
             engine, repo_id, target_name, cross_repo, max_results, scope_to_class, modified_within_commits,
             resolved_only, file, declared(repo_id, cross_repo), owner, include_tests,
@@ -846,7 +850,10 @@ def build_server(
         targets it depends on, and risk_level is the riskiest one's); past five, their
         dependents are listed together, with a notice. Another same-named definition
         can itself appear as a dependent. Dependents in test code come after all others in
-        each list, which adds test_count; include_tests=false leaves them out."""
+        each list, which adds test_count; include_tests=false leaves them out.
+        endpoints lists the API routes whose handler is the component or a dependent
+        (rows as list_endpoints gives them, in an envelope); they are not dependents,
+        so risk_level, from the direct dependents, leaves them out."""
         return devgraph_tools.impact_analysis(
             engine, repo_id, component_name, cross_repo, max_results, file, declared(repo_id, cross_repo), owner,
             include_tests,
@@ -870,7 +877,8 @@ def build_server(
         200-file cap, unreadable, or renamed) counts every indexed symbol in it, with a
         notice; a changed symbol the index doesn't have is named in a notice. Never fetches; same ref rules and caps as
         compare_branches. Dependents come from the last index of the working tree and are
-        wrapped in {count, results, truncated} envelopes."""
+        wrapped in {count, results, truncated} envelopes; endpoints lists the API routes
+        whose handler is a changed symbol or a dependent, as impact_analysis does."""
         return devgraph_tools.impact_analysis_for_diff(
             engine, registry, repo_id, base_ref, head_ref, cross_repo, max_results
         )
@@ -880,7 +888,9 @@ def build_server(
         """Generate a high-level architectural explanation of the repository (a service
         uses databases, vector stores, queues and caches):
         services_and_datastores ({service, uses}) and endpoints ({endpoints, calls}, only
-        services some endpoint calls), each a {count, results, truncated} envelope."""
+        services some endpoint calls), each a {count, results, truncated} envelope. Each
+        endpoint's path has a leading "/" (a Django pattern's added, as list_endpoints
+        does)."""
         return devgraph_tools.explain_architecture(engine, repo_id, max_results)
 
     @server.tool(annotations=_READ_ONLY)
@@ -1012,8 +1022,9 @@ def build_server(
         its repo-relative path or id; a method may be named with its class, "A.save" or
         "A::save". An ambiguous name returns candidates; call again with label, file and
         owner. A route handler answers as its real function, with its stub's
-        relationships folded in when the stub provably stands for it; a stub that
-        doesn't is marked unresolved_handler. A code symbol's ref carries owner (the classes or functions it is declared
+        relationships folded in when the stub provably stands for it; a stub routes
+        share because their handlers share a name is left out when each route resolved
+        to its own function; any other stub is marked unresolved_handler. A code symbol's ref carries owner (the classes or functions it is declared
         in, "" at the top level), which picks it from a same-named one in its file. Each
         ref in the result is the next call's
         arguments. One hop per call, at most 50 neighbours per type; direction,
