@@ -15,6 +15,7 @@ repo's own `record.path`).
 
 from __future__ import annotations
 
+import gc
 import logging
 import os
 import pickle
@@ -970,7 +971,8 @@ def _index_paths(
             )
             saved = extractions.saved(rel_path)
             try:
-                count = single()
+                with _collection_paused():
+                    count = single()
             except RecursionError:
                 # Extraction raises before it writes, so this is a clean retry.
                 count = _run_deep(single)
@@ -1212,7 +1214,8 @@ def _index_paths(
                 endpoints = [node[1] for node in entry.nodes if node[0] == "Endpoint"]
                 owned = partial(_owning_service_relationships, repo_id, rel_path, content, services, endpoints)
                 try:
-                    service_rels.extend(owned())
+                    with _collection_paused():
+                        service_rels.extend(owned())
                 except RecursionError:
                     # As pass 1 read it: again on a deep stack, and a file
                     # deeper still writes none, never ending the batch.
@@ -1302,7 +1305,8 @@ def _run_deep(fn: Callable[[], int]) -> int:
 
     def run() -> None:
         try:
-            outcome["value"] = fn()
+            with _collection_paused():
+                outcome["value"] = fn()
         except BaseException as exc:  # re-raised on the calling thread
             outcome["error"] = exc
 
@@ -1325,6 +1329,36 @@ def _run_deep(fn: Callable[[], int]) -> int:
     if "error" in outcome:
         raise outcome["error"]  # type: ignore[misc]
     return outcome["value"]  # type: ignore[return-value]
+
+
+_paused_lock = threading.Lock()
+_paused_count = 0
+_paused_resume = False
+
+
+@contextmanager
+def _collection_paused():
+    """No cyclic garbage collection meanwhile, on any thread. An extraction
+    that recurses until RecursionError fills the stack to the recursion
+    limit, and a collection that starts there runs other objects'
+    finalizers (an unclosed Neo4j session's, say) with no room left: each
+    raises RecursionError of its own, reported only as an unraisable
+    exception, its cleanup lost. The garbage waits for the next collection
+    after. Nested and concurrent uses resume collection once, as the last
+    leaves, and only if it ran before the first came."""
+    global _paused_count, _paused_resume
+    with _paused_lock:
+        if _paused_count == 0:
+            _paused_resume = gc.isenabled()
+            gc.disable()
+        _paused_count += 1
+    try:
+        yield
+    finally:
+        with _paused_lock:
+            _paused_count -= 1
+            if _paused_count == 0 and _paused_resume:
+                gc.enable()
 
 
 def _log_file_failure(what: str, repo_id: str, path: object, exc: Exception) -> None:

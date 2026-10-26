@@ -8,6 +8,8 @@ now extracted again with a large stack (`dispatch._run_deep`); one deeper
 than that allows is left out and reported, live and fresh alike.
 """
 
+import gc
+
 import pytest
 
 from devgraph.graph.engine import GraphEngine, provision_repository_schema
@@ -171,3 +173,44 @@ def test_index_paths_skips_a_file_whose_retry_cannot_start(tmp_path, monkeypatch
     assert skipped == {"deep.py": TOO_DEEP}
     assert Engine.deleted == ["deep.py"]
     assert Engine.marks["deep.py"][0] == TOO_DEEP
+
+
+def test_no_collection_runs_at_the_edge_of_the_stack(tmp_path, monkeypatch):
+    """A collection that starts while an extraction is at the recursion limit
+    runs other objects' finalizers with no room left, each an unraisable
+    RecursionError: the first try and the retry run with collection paused,
+    and it resumes after."""
+    from tests.indexer.test_file_failures import _QuietEngine
+
+    class Engine(_QuietEngine):
+        def update_skipped_files(self, repo_id, add=None, drop=(), replace=False):
+            pass
+
+        def delete_nodes_by_source_file(self, repo_id, rel):
+            pass
+
+    collecting: list[bool] = []
+
+    def too_deep(*args):
+        collecting.append(gc.isenabled())
+        raise RecursionError("maximum recursion depth exceeded")
+
+    (tmp_path / "deep.py").write_text("x = 1\n")
+    stub(monkeypatch, dispatch, "_index_single_path", too_deep)
+    assert gc.isenabled()
+    skipped: dict[str, str] = {}
+    index_paths(Engine(), "_unit_deep", tmp_path, {tmp_path / "deep.py"}, skipped=skipped)
+    assert skipped == {"deep.py": TOO_DEEP}
+    assert collecting == [False, False]
+    assert gc.isenabled()
+
+
+def test_a_pause_leaves_collection_off_when_it_was_off():
+    gc.disable()
+    try:
+        with dispatch._collection_paused():
+            with dispatch._collection_paused():
+                assert not gc.isenabled()
+        assert not gc.isenabled()
+    finally:
+        gc.enable()
