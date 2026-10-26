@@ -3111,7 +3111,9 @@ def get_source(
         notice = f"the file declares {declared} but is not valid {declared}; decoded as {encoding}, as the indexer reads it"
     elif declared is None and encoding != "utf-8":
         notice = f"the file is not valid UTF-8; decoded as {encoding}, as the indexer reads it"
-    lines = text.splitlines()
+    # Split as tree-sitter counts rows, on "\n" only: splitlines() would also
+    # break on \f, \v, \x1c-\x1e, \x85, U+2028 and U+2029 and shift the range.
+    lines = [line.removesuffix("\r") for line in text.split("\n")]
 
     source_text = "\n".join(lines[start_line - 1 : end_line])
 
