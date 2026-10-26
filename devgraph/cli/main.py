@@ -3685,7 +3685,7 @@ def prune(
         counts = engine.repo_node_counts(orphaned)
         console.print(f"Found {len(orphaned)} repo id(s) in Neo4j that this registry doesn't hold:")
         for rid in sorted(orphaned):
-            console.print(f"  {escape(str(rid))} ({counts.get(rid, 0)} node(s))", soft_wrap=True)
+            console.print(f"  {escape(str(rid))} ({escape(str(counts.get(rid, 0)))} node(s))", soft_wrap=True)
         console.print(
             "[yellow]If another DevGraph install (another user, WSL, a container deployment, a test run) "
             "uses this Neo4j, these may be its repositories: deleting them deletes its data.[/yellow]",
