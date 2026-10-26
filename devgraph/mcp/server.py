@@ -902,7 +902,7 @@ def build_server(
         {name, method, path, mounted, framework, files, handlers ({label, name, file, owner}:
         a Function, or a Django class-based view's Class), services, repo_id}. Filters: method ("GET", "*" for an every-method route),
         path_prefix (whole segments: "/api" matches "/api/users", not "/apis"), framework
-        (ASP.NET Core, Django, Express, FastAPI, Flask, Go, Spring) and service (the compose
+        (ASP.NET Core, Django, Express, FastAPI, Flask, Go, NestJS, Spring) and service (the compose
         service an endpoint CALLS). A route whose mount its file doesn't show has mounted
         false, its own path, and a name like "GET ?/:id (routes/users.js)"; no path_prefix
         matches it; a Django pattern's path gains its leading "/". method takes any HTTP

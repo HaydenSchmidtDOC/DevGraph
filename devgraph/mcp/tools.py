@@ -2331,7 +2331,7 @@ def list_services(
 
 #: The `framework` an Endpoint carries, by the extractors that write them
 #: (indexer/apis/extractor.py, and the add_route callers of indexer/apis/routes.py).
-ENDPOINT_FRAMEWORKS = ("ASP.NET Core", "Django", "Express", "FastAPI", "Flask", "Go", "Spring")
+ENDPOINT_FRAMEWORKS = ("ASP.NET Core", "Django", "Express", "FastAPI", "Flask", "Go", "NestJS", "Spring")
 #: A method filter: an HTTP method token (`GET`, `PROPFIND`), or "*".
 _ENDPOINT_METHOD = re.compile(r"[A-Z][A-Z-]*|\*")
 
