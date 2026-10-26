@@ -32,7 +32,7 @@ def engine():
     engine.upsert_node("Module", REPO, "core.py")
     engine.upsert_node("Class", REPO, "Engine")
     engine.upsert_relationship("Module", "core.py", "CONTAINS", "Class", "Engine", REPO)
-    for i in range(3):
+    for i in reversed(range(3)):  # created out of name order: ties must still rank by name
         engine.upsert_node("Function", REPO, f"use{i}")
         engine.upsert_relationship("Function", f"use{i}", "CALLS", "Class", "Engine", REPO)
     for k in range(8):
