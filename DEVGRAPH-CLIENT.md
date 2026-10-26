@@ -305,14 +305,25 @@ and `describe_node` do, or a method named with its class (`A.run`,
 an error. `get_source` on an unknown name (or one not in `file`, or of no
 such `owner`) is an error with similar names, never an all-null answer.
 
+**Endpoints a change reaches**: an API route reaches its handler by
+`IMPLEMENTS`, not `CALLS`, so it is never a dependent or a caller. Instead
+`impact_analysis` and `impact_analysis_for_diff` add `endpoints`, the routes
+whose handler is the changed component or any of its dependents (to four
+hops), and `find_callers` adds `routed_by`, the routes the target handles.
+Each is a `{count, results, truncated}` envelope of rows shaped as
+`list_endpoints` gives them (`name`, `method`, `path`, `mounted`,
+`framework`, `files`, `handlers`, `services`, `repo_id`); `name` is what
+`trace_request_flow` takes. `risk_level` still counts direct dependents only.
+
 **Response shape (`count`/`results`/`truncated`)**: `search_component`,
 `find_callers`, `list_services`, `list_endpoints`, `find_related_prs`, `issue_history_for`,
 `find_requirements_for` and `blame_component` return
 `{"count": N, "results": [...], "truncated": bool}` instead of a bare
 list — read the match set from `result["results"]`, and check `truncated`
 before assuming you've seen everything. `find_related_files`,
-`explain_architecture` and `impact_analysis` apply the same envelope to each
-of their list-valued fields individually (e.g. `impact["direct_dependents"]["results"]`). Pass
+`explain_architecture`, `impact_analysis` and `impact_analysis_for_diff` apply the same envelope to each
+of their list-valued fields individually (e.g. `impact["direct_dependents"]["results"]`,
+`impact["endpoints"]["results"]`), as `find_callers` does to `routed_by`. Pass
 `max_results` (default 15) to widen the sample when you genuinely need more
 than the default. `search_component` ranks the whole query as the exact name
 first (then the same name in other case), then names starting with or
@@ -377,7 +388,7 @@ Prefer these over re-reading files when the question is structural:
 | "What calls X, but only recently modified?" | `find_callers` with `modified_within_commits=N` (filters results to entities touched in the last N commits) |
 | "What calls X, but only from within class Y?" | `find_callers` with `scope_to_class=Y` (cuts noise from unrelated same-named methods elsewhere in the repo) |
 | "What definitely calls X?" | `find_callers` with `resolved_only=True` (Python callers resolved through scope or imports) |
-| "What breaks if I change X?" | `impact_analysis` (name, not path; test-code dependents come last in each list, with `test_count`, and `include_tests=False` leaves them out) |
+| "What breaks if I change X?" | `impact_analysis` (name, not path; test-code dependents come last in each list, with `test_count`, and `include_tests=False` leaves them out; `endpoints` lists the API routes it reaches) |
 | "What breaks across this whole PR/diff?" | `impact_analysis_for_diff` (base_ref/head_ref, both must exist locally — never fetches) |
 | "What does X depend on?" | `get_service_dependencies` (service name), `find_related_files` (function/class name, not path; entries in test code come last in each list, with `test_count`, and `include_tests=False` leaves them out) |
 | "Trace a request from this endpoint through services/datastores" | `trace_request_flow` (endpoint name like `GET /users/<id>`, or a bare path like `/users/<id>` for every method) |
@@ -399,7 +410,7 @@ and classes added, removed and changed in each file, with line numbers. Its
 `impacted_callers` come from the last index of the working tree, not from
 either ref, so read them as a hint. `impact_analysis_for_diff` compares the same
 way and traces dependents, direct and transitive, of the functions and classes
-changed or removed; added ones are listed in `added_symbols`, since nothing
+changed or removed, with the API `endpoints` they reach; added ones are listed in `added_symbols`, since nothing
 depends on them yet. A changed code file whose symbols weren't diffed (past the
 200-file cap, unreadable, or renamed) counts every indexed symbol in it, and a
 notice says so; so does a changed symbol the index doesn't have, whose

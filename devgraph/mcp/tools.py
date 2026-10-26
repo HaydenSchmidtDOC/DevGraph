@@ -112,13 +112,36 @@ IMPACT_MAX_SPLIT = 5
 IMPACT_MAX_DEPTH = 4
 
 
+#: Cypher binding an Endpoint `e`'s `handlers` (the Functions, and a Django
+#: class-based view's Class, it IMPLEMENTS) and `services` (the compose
+#: services it CALLS); `_ENDPOINT_FIELDS` then names what `_endpoint_row` reads.
+_ENDPOINT_DETAILS = """CALL (e) {
+    OPTIONAL MATCH (e)-[:IMPLEMENTS]->(f) WHERE f:Function OR f:Class
+    RETURN [h IN collect(DISTINCT {label: labels(f)[0], name: f.name, file: f.file, owner: f.owner})
+            WHERE h.name IS NOT NULL]
+           AS handlers
+}
+CALL (e) {
+    OPTIONAL MATCH (e)-[:CALLS]->(s:Service)
+    RETURN [n IN collect(DISTINCT s.name) WHERE n IS NOT NULL] AS services
+}
+"""
+_ENDPOINT_FIELDS = (
+    "{name: e.name, framework: e.framework, files: coalesce(e.sources, [e.source]), "
+    "handlers: handlers, services: services, repo_id: e.repo_id}"
+)
+
+
 def _impact_expansion(cross_repo: bool, with_ids: bool = False) -> str:
     """Cypher continuing from `WITH collect(n) AS l0` (the changed nodes): one
     CALL per hop collecting the distinct nodes with a CALLS/USES/DEPENDS_ON edge
     into the previous hop's nodes, never one seen at an earlier hop, then
     returning `direct_dependents` (hop 1), `transitive_dependents` (hops 2 to
-    `IMPACT_MAX_DEPTH`), `direct_count` and `matched` (the changed nodes' {name, file, owner}).
-    `with_ids` adds each dependent's `id` (its elementId).
+    `IMPACT_MAX_DEPTH`), `direct_count`, `matched` (the changed nodes' {name, file, owner})
+    and `endpoints`: the Endpoints that IMPLEMENTS a changed node or a dependent
+    (an API route reaches its handler that way, one step past it), as
+    `_ENDPOINT_FIELDS` maps; they are not dependents, so `direct_count` leaves
+    them out. `with_ids` adds each dependent's `id` (its elementId).
 
     Expanding distinct nodes hop by hop does work proportional to the nodes
     and edges within reach; a variable-length path enumerates every path, which
@@ -134,6 +157,13 @@ def _impact_expansion(cross_repo: bool, with_ids: bool = False) -> str:
             f"AND {' AND '.join(f'NOT d IN {s}' for s in seen)} "
             f"RETURN collect(DISTINCT d) AS l{hop} }}"
         )
+    levels = [f"l{k}" for k in range(IMPACT_MAX_DEPTH + 1)]
+    endpoint_scope = _cross_scope("e", "AND") if cross_repo else "AND e.repo_id = $repo_id"
+    parts.append(
+        f"CALL ({', '.join(levels)}) {{ UNWIND {' + '.join(levels)} AS m "
+        f"MATCH (e:Endpoint)-[:IMPLEMENTS]->(m) WHERE true {endpoint_scope} WITH DISTINCT e "
+        f"{_ENDPOINT_DETAILS} RETURN collect({_ENDPOINT_FIELDS}) AS endpoints }}"
+    )
     transitive = " + ".join(f"l{k}" for k in range(2, IMPACT_MAX_DEPTH + 1))
     ref = (
         "{name: d.name, type: labels(d)[0], file: coalesce(d.file, d.source_file), owner: "
@@ -142,7 +172,8 @@ def _impact_expansion(cross_repo: bool, with_ids: bool = False) -> str:
     parts.append(
         f"RETURN [d IN l1 | {ref}] AS direct_dependents, "
         f"[d IN {transitive} | {ref}] AS transitive_dependents, "
-        "size(l1) AS direct_count, [n IN l0 | {name: n.name, file: n.file, owner: coalesce(n.owner, '')}] AS matched"
+        "size(l1) AS direct_count, [n IN l0 | {name: n.name, file: n.file, owner: coalesce(n.owner, '')}] AS matched, "
+        "endpoints"
     )
     return "\n".join(parts)
 
@@ -1605,7 +1636,10 @@ def find_callers(
         `target_files`, the files of the targets it calls (at most 10, with
         `target_file_count` past that; a file-less target is never listed), and
         the dict adds `ambiguous_targets`, a {count, results, truncated} envelope of their
-        {label, file} (file None for a file-less one; repo_id too when cross_repo)
+        {label, file} (file None for a file-less one; repo_id too when cross_repo).
+        `routed_by` is a {count, results, truncated} envelope of the Endpoints
+        that IMPLEMENTS the target (a route is no caller), each as
+        list_endpoints lists it, ordered by name.
 
     Raises:
         ToolError: no node has that name, or none in `file`.
@@ -1660,12 +1694,26 @@ def find_callers(
 
     # Counted apart from the capped rows, so it is exact however many there are.
     tests = _query(engine, f"{callers} WITH DISTINCT caller WHERE {is_test} RETURN count(caller) AS tests", params)
+    # A route reaches its handler by IMPLEMENTS, not CALLS: listed apart.
+    routes = f"""
+    {_named_nodes(labels, "target_name", cross_repo, "target")}
+    MATCH (e:Endpoint)-[:IMPLEMENTS]->(target)
+    WHERE true
+    {recency_filter}
+    AND ($file IS NULL OR target.file = $file)
+    AND {_OWNER_MATCH.replace("n.", "target.")}
+    WITH DISTINCT e
+    {_ENDPOINT_DETAILS}
+    RETURN {_ENDPOINT_FIELDS} AS endpoint
+    """
+    routed_by = [row["endpoint"] for row in _query(engine, routes, params)]
     results, more = _list_query(engine, cypher, params)
     results = [_located(row) for row in results]
     if ambiguous:
         results = [_with_target_files(row, row["target_files"]) for row in results]
     envelope = _capped_envelope(results, more, max_results)
     envelope["test_count"] = tests[0]["tests"] if tests else 0
+    envelope["routed_by"] = _endpoints_envelope(routed_by, max_results)
     if ambiguous:
         envelope["ambiguous_targets"] = ambiguous
     return envelope
@@ -1986,7 +2034,10 @@ def impact_analysis(
         itself be listed as a dependent. Each list is ordered by name, file and
         owner, dependents in test code last, and its envelope adds
         `test_count`, its dependents in test code (listed or not); risk_level
-        counts them too.
+        counts them too. `endpoints` is a {count, results, truncated} envelope of
+        the Endpoints that IMPLEMENTS the component or any dependent (a route
+        reaches its handler that way, so it is never a dependent; risk_level
+        leaves them out), each as list_endpoints lists it, ordered by name.
 
     Raises:
         ToolError: no node has that name, or none in `file`.
@@ -2014,7 +2065,7 @@ def impact_analysis(
     CALL (l0) {{
     {_impact_expansion(cross_repo, with_ids=split)}
     }}
-    RETURN target_file, direct_dependents, transitive_dependents, direct_count
+    RETURN target_file, direct_dependents, transitive_dependents, direct_count, endpoints
     ORDER BY target_file
     """
     params = {"component_name": component_name, "file": file, "owner": owner, "split": split}
@@ -2027,6 +2078,7 @@ def impact_analysis(
         answer = {
             "direct_dependents": dependents_envelope([_located(d) for d in row["direct_dependents"]]),
             "transitive_dependents": dependents_envelope([_located(d) for d in row["transitive_dependents"]]),
+            "endpoints": _endpoints_envelope(row["endpoints"], max_results),
             "risk_level": _risk_level(row["direct_count"]),
         }
         if ambiguous:
@@ -2054,6 +2106,7 @@ def impact_analysis(
     }
     return {
         **{key: dependents_envelope(rows) for key, rows in lists.items()},
+        "endpoints": _endpoints_envelope([e for row in results for e in row["endpoints"]], max_results),
         "risk_level": _risk_level(max(row["direct_count"] for row in results)),
         "ambiguous_targets": ambiguous,
     }
@@ -2061,6 +2114,13 @@ def impact_analysis(
 
 def _risk_level(direct_count: int) -> str:
     return "high" if direct_count > 10 else "medium" if direct_count > 3 else "low"
+
+
+def _endpoints_envelope(rows: list[dict[str, Any]], max_results: int) -> dict[str, Any]:
+    """The distinct Endpoints of `rows` (`_ENDPOINT_FIELDS`), each as list_endpoints
+    lists it, ordered by repository and name, in a {count, results, truncated} envelope."""
+    distinct = {(row["repo_id"], row["name"]): row for row in rows}
+    return _envelope([_endpoint_row(distinct[key]) for key in sorted(distinct)], max_results)
 
 
 _DIFF_TARGETS_CYPHER = """
@@ -2132,7 +2192,8 @@ def impact_analysis_for_diff(
         Dict with changed_files; added_symbols, changed_symbols and
         removed_symbols ({name, kind, container, file}); changed_components (the
         names traced); direct_dependents and transitive_dependents ({count,
-        results, truncated} envelopes); risk_level; truncated and
+        results, truncated} envelopes); endpoints (as impact_analysis gives
+        them); risk_level; truncated and
         truncated_reasons (compare_branches' caps); and notices. Dependents come
         from the last index of the working tree, not from either ref.
 
@@ -2207,7 +2268,7 @@ def impact_analysis_for_diff(
         )
     files = list(dict.fromkeys(f for paths in fallback.values() for f in paths))
 
-    row = {"direct_dependents": [], "transitive_dependents": [], "direct_count": 0, "matched": []}
+    row = {"direct_dependents": [], "transitive_dependents": [], "direct_count": 0, "matched": [], "endpoints": []}
     if targets or files:
         cypher = _DIFF_TARGETS_CYPHER + _impact_expansion(cross_repo)
         rows = _query(engine, cypher, {"repo_id": repo_id, "targets": targets, "files": files})
@@ -2231,6 +2292,7 @@ def impact_analysis_for_diff(
         "changed_components": sorted({m["name"] for m in row["matched"] if m["name"] is not None}),
         "direct_dependents": _envelope([_located(d) for d in row["direct_dependents"]], max_results),
         "transitive_dependents": _envelope([_located(d) for d in row["transitive_dependents"]], max_results),
+        "endpoints": _endpoints_envelope(row["endpoints"], max_results),
         "risk_level": _risk_level(row["direct_count"]),
         "truncated": bool(reasons),
         "truncated_reasons": list(reasons),
@@ -2425,16 +2487,7 @@ def list_endpoints(
       AND ($prefix IS NULL OR (NOT rest STARTS WITH '?'
            AND ($prefix = '/' OR path = $prefix OR path STARTS WITH $prefix + '/')))
       AND ($service IS NULL OR EXISTS {{ MATCH (e)-[:CALLS]->(s:Service) WHERE s.name = $service }})
-    CALL (e) {{
-        OPTIONAL MATCH (e)-[:IMPLEMENTS]->(f) WHERE f:Function OR f:Class
-        RETURN [h IN collect(DISTINCT {{label: labels(f)[0], name: f.name, file: f.file, owner: f.owner}})
-                WHERE h.name IS NOT NULL]
-               AS handlers
-    }}
-    CALL (e) {{
-        OPTIONAL MATCH (e)-[:CALLS]->(s:Service)
-        RETURN [n IN collect(DISTINCT s.name) WHERE n IS NOT NULL] AS services
-    }}
+    {_ENDPOINT_DETAILS}
     RETURN e.name AS name, e.framework AS framework, coalesce(e.sources, [e.source]) AS files,
            handlers, services, e.repo_id AS repo_id
     ORDER BY (e.repo_id = $repo_id) DESC, e.repo_id, e.name
