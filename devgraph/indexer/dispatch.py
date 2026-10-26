@@ -256,6 +256,16 @@ def index_outdated(engine: GraphEngine, repo_id: str) -> bool:
     return (engine.index_format(repo_id) or 1) < INDEX_FORMAT
 
 
+def scan_options_pending(engine: GraphEngine, repo_id: str, docs_path: str | None, mentions_enabled: bool) -> bool:
+    """True when the repository's docs path or mentions setting differs from
+    the ones its last full scan used (`devgraph annotate --docs-path`,
+    `devgraph mentions`): only a full scan indexes, or removes, every note,
+    Document and MENTIONS edge they decide. An index with none recorded
+    (before INDEX_FORMAT 22) is outdated, and its upgrade records them."""
+    used = engine.scan_options(repo_id)
+    return used is not None and used != (docs_path or "", bool(mentions_enabled))
+
+
 def schema_pending(engine: GraphEngine, repo_id: str, repo_root: Path) -> bool:
     """True when the schema file differs from the one the graph was built with.
 
@@ -2403,6 +2413,11 @@ def _docs_folder(repo_root: Path, docs_path: str | None) -> str | None:
     return folder.relative_to(root).as_posix()
 
 
+def _is_repo_root(repo_root: Path, docs_path: str) -> bool:
+    """Whether the docs path is the repository root itself."""
+    return (repo_root / docs_path).resolve() == repo_root.resolve()
+
+
 def prune_stale_files(
     engine: GraphEngine,
     repo_id: str,
@@ -2426,6 +2441,11 @@ def prune_stale_files(
     touched. Every path the graph has that is no longer an indexable file on
     disk is routed through remove_paths, which handles the delete-vs-unclaim
     distinction per node.
+
+    Docs notes outside the docs path, every note when there is none, and
+    every mentions Document with `mentions_enabled` off are deleted too:
+    nodes of files still on disk that the scan's settings no longer index
+    (`devgraph annotate --docs-path`, `devgraph mentions disable`).
 
     Module nodes with no file key at all, left by an older git-history sync,
     are deleted first, and so are Class nodes with no `file` or `source` (a
@@ -2463,10 +2483,18 @@ def prune_stale_files(
     docs_folder = _docs_folder(repo_root, docs_path)
     # Skipped when the docs path is the repository root: every path is under
     # it, so nothing tells a bare filename key from a root-level note's path.
-    if docs_folder is not None:
+    # With no docs path (or one outside the repository) no note is indexed.
+    if not (docs_path and _is_repo_root(repo_root, docs_path)):
         misplaced = engine.delete_docs_notes_outside(repo_id, docs_folder)
         if misplaced:
-            logger.info("removed %d docs notes keyed outside %s from %s", misplaced, docs_folder, repo_id)
+            logger.info(
+                "removed %d docs notes keyed outside %s from %s", misplaced, docs_folder or "the docs path", repo_id
+            )
+    # Mentions indexing turned off since: a fresh scan makes no Document.
+    if not mentions_enabled:
+        documents = engine.delete_documents(repo_id)
+        if documents:
+            logger.info("removed %d mentions Documents from %s (mentions indexing is off)", documents, repo_id)
     stale = _graph_files(engine, repo_id, repo_root) - on_disk
     if unreadable:
         # A folder that couldn't be listed says nothing about its files: keep them.
@@ -3040,6 +3068,7 @@ def full_scan(
             _sync_docs_edges(engine, repo_id, repo_root, applied_docs)
         engine.write_resolver_config(repo_id, resolver)
         _check_full_scan_claim(repo_id)  # taken over meanwhile: that scan stamps it
+        engine.set_scan_options(repo_id, docs_path or "", mentions_enabled)
         engine.set_index_format(repo_id, INDEX_FORMAT)
         return indexed
     finally:

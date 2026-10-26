@@ -1466,6 +1466,12 @@ def test_prune_skips_walked_paths_outside_the_repository(tmp_path, monkeypatch):
         def delete_bare_class_stubs(self, repo_id):
             return 0
 
+        def delete_docs_notes_outside(self, repo_id, folder):
+            return 0
+
+        def delete_documents(self, repo_id):
+            return 0
+
     assert dispatch.prune_stale_files(FakeEngine(), "r", repo) == 1
     assert removed == [{repo / "gone.py"}]
 

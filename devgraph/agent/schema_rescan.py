@@ -5,6 +5,10 @@ filesystem-provider writes pause until the schema is applied. This scheduler
 applies it with a full rescan once the file has stopped changing for a quiet
 period, so a burst of edits costs one rescan, not one per save.
 `devgraph rescan` applies immediately instead.
+
+It also upgrades an index of an older format, and rescans a repository whose
+docs path or mentions setting changed since its last full scan
+(dispatch.scan_options_pending), both at once.
 """
 
 from __future__ import annotations
@@ -17,7 +21,9 @@ from collections.abc import Callable
 from typing import Any
 
 from devgraph.config.project_schema import ProjectSchemaError, resolve_effective_schema, schema_file_hash
-from devgraph.indexer.dispatch import full_scan, full_scan_elsewhere, full_scan_turn, index_outdated, schema_pending
+from devgraph.indexer.dispatch import (
+    full_scan, full_scan_elsewhere, full_scan_turn, index_outdated, scan_options_pending, schema_pending,
+)
 from devgraph.indexer.walk import RepoRootUnavailable
 
 logger = logging.getLogger(__name__)
@@ -114,6 +120,27 @@ class SchemaRescanScheduler:
                         except Exception:
                             logger.debug("schema rescan callback failed for %s", repo.repo_id, exc_info=True)
                     continue
+                if repo.last_indexed and scan_options_pending(
+                    self._engine, repo.repo_id, repo.docs_path, repo.mentions_enabled
+                ):
+                    # `devgraph mentions` or `annotate --docs-path` changed
+                    # what a full scan indexes: apply it now, no quiet period.
+                    result = self._exclusive(repo.repo_id, lambda: self._apply_options(repo.repo_id))
+                    if result is None:
+                        continue
+                    count, _ = result
+                    self._failing.discard(repo.repo_id)
+                    rescanned.append(repo.repo_id)
+                    logger.info(
+                        "applied a changed docs path or mentions setting to %s with a full rescan (%d files)",
+                        repo.repo_id, count,
+                    )
+                    if self._on_rescanned is not None:
+                        try:
+                            self._on_rescanned(repo.repo_id, count)
+                        except Exception:
+                            logger.debug("schema rescan callback failed for %s", repo.repo_id, exc_info=True)
+                    continue
                 if not schema_pending(self._engine, repo.repo_id, repo.path):
                     self._seen.pop(repo.repo_id, None)
                     self._invalid.pop(repo.repo_id, None)
@@ -186,6 +213,18 @@ class SchemaRescanScheduler:
         with full_scan_turn(repo.repo_id, lambda: self._waiting(repo.repo_id), self._engine):
             if not index_outdated(self._engine, repo.repo_id):
                 return None  # upgraded by the scan this one waited for
+            return self._rescan(repo)
+
+    def _apply_options(self, repo_id: str) -> tuple[int, bool] | None:
+        """`_rescan` with the registry's current settings, unless a scan
+        applied them while this pass waited (None then)."""
+        repo = self._registry.get(repo_id)
+        if not scan_options_pending(self._engine, repo_id, repo.docs_path, repo.mentions_enabled):
+            return None
+        with full_scan_turn(repo_id, lambda: self._waiting(repo_id), self._engine):
+            repo = self._registry.get(repo_id)
+            if repo is None or not scan_options_pending(self._engine, repo_id, repo.docs_path, repo.mentions_enabled):
+                return None  # applied by the scan this one waited for
             return self._rescan(repo)
 
     def _waiting(self, repo_id: str) -> bool:

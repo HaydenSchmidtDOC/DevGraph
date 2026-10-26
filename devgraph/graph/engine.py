@@ -2000,6 +2000,41 @@ class GraphEngine:
             records = [record.data() for record in result or []]
         return records[0]["format"] if records else None
 
+    def set_scan_options(self, repo_id: str, docs_path: str, mentions_enabled: bool) -> None:
+        """Record the docs path and mentions setting the repository's last full scan used."""
+        with self._driver.session() as session:
+            _run(
+                session,
+                "MATCH (r:Repository {repo_id: $repo_id}) "
+                "SET r.scan_docs_path = $docs_path, r.scan_mentions = $mentions",
+                repo_id=repo_id, docs_path=docs_path, mentions=mentions_enabled,
+            )
+
+    def scan_options(self, repo_id: str) -> tuple[str, bool] | None:
+        """(docs path, mentions setting) the last full scan used, or None when
+        none is recorded (an index before format 22, or no Repository node)."""
+        with self._driver.session() as session:
+            result = _run_records(
+                session,
+                "MATCH (r:Repository {repo_id: $repo_id}) WHERE r.scan_mentions IS NOT NULL "
+                "RETURN r.scan_docs_path AS docs_path, r.scan_mentions AS mentions",
+                repo_id=repo_id,
+            )
+            records = [record.data() for record in result or []]
+        return (records[0]["docs_path"], records[0]["mentions"]) if records else None
+
+    def delete_documents(self, repo_id: str) -> int:
+        """Delete this repo's mentions Documents, with their MENTIONS edges, and
+        return how many went."""
+        with self._driver.session() as session:
+            result = _run_records(
+                session,
+                "MATCH (d:Document {repo_id: $repo_id}) DETACH DELETE d RETURN count(d) AS n",
+                repo_id=repo_id,
+            )
+            record = result[0] if result else None
+            return record["n"] if record else 0
+
     def read_all_applied_schemas(self) -> list[dict[str, Any]]:
         """Every repository's recorded user labels and keys, from the graph itself."""
         with self._driver.session() as session:
@@ -2273,22 +2308,22 @@ class GraphEngine:
             record = result[0] if result else None
             return record["n"] if record else 0
 
-    def delete_docs_notes_outside(self, repo_id: str, folder: str) -> int:
+    def delete_docs_notes_outside(self, repo_id: str, folder: str | None) -> int:
         """Delete this repo's docs notes (Requirement, DesignDecision,
         ArchitectureNote) whose `source_file` is not under `folder` (a
-        repo-relative POSIX path, not the root), with their edges, and return
-        how many went. Notes under the docs path record their repo-relative
-        path, so only a note an older scan keyed by its bare filename, or one
-        left from a former docs path, looks like this."""
+        repo-relative POSIX path, not the root; None: every note), with their
+        edges, and return how many went. Notes under the docs path record
+        their repo-relative path, so only a note an older scan keyed by its
+        bare filename, or one left from a former docs path, looks like this."""
         with self._driver.session() as session:
             result = _run_records(
                 session,
                 "MATCH (n {repo_id: $repo_id}) "
                 "WHERE (n:Requirement OR n:DesignDecision OR n:ArchitectureNote) "
-                "  AND n.source_file IS NOT NULL AND NOT n.source_file STARTS WITH $prefix "
+                "  AND n.source_file IS NOT NULL AND ($prefix IS NULL OR NOT n.source_file STARTS WITH $prefix) "
                 "DETACH DELETE n RETURN count(n) AS n",
                 repo_id=repo_id,
-                prefix=folder.rstrip("/") + "/",
+                prefix=None if folder is None else folder.rstrip("/") + "/",
             )
             record = result[0] if result else None
             return record["n"] if record else 0
