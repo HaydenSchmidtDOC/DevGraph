@@ -532,3 +532,51 @@ def test_a_router_function_mounted_from_another_file_takes_its_mount():
         nodes, [], "web/routes.py", router_file.route_exports, prefixes, keep_slash=True
     )
     assert [node["name"] for node in mounted] == ["GET /api/repos"]
+
+
+def test_a_function_returning_a_module_level_router_is_followed():
+    code = """
+        from fastapi import APIRouter
+
+        router = APIRouter(prefix="/users")
+
+        @router.get("/{user_id}")
+        def get_user(user_id: int):
+            pass
+
+        def get_router():
+            return router
+    """
+    result = _extract(code, "web/users.py")
+    assert sorted(entry[0] for entry in _split(result.route_exports)) == [
+        "get_router()",
+        "router",
+    ]
+    main = _extract(
+        """
+        from fastapi import FastAPI
+        from web.users import get_router
+
+        app = FastAPI()
+        app.include_router(get_router(), prefix="/api")
+        """,
+        "web/app.py",
+    )
+    prefixes = MountTable({"web/app.py": main.route_mounts}).route_prefixes(
+        "web/users.py", result.route_exports
+    )
+    nodes = [
+        {"label": "Endpoint", "name": e.name, "properties": {}}
+        for e in result.endpoints
+    ]
+    mounted, _rels = mount_routes(
+        nodes, [], "web/users.py", result.route_exports, prefixes, keep_slash=True
+    )
+    assert [node["name"] for node in mounted] == ["GET /api/users/{user_id}"]
+    # Mounted in its own file through the function.
+    same = _extract(
+        code.rstrip()
+        + "\n\n        app = FastAPI()\n        app.include_router(get_router())\n",
+        "web/users.py",
+    )
+    assert sorted({e.name for e in same.endpoints}) == ["GET /users/{user_id}"]

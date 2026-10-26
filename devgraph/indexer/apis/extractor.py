@@ -349,16 +349,17 @@ class _Routes:
         return found
 
     def factories(self, function: str) -> list[str]:
-        """The router variables a top-level `function` binds and returns."""
+        """The router variables a top-level `function` returns: one it binds,
+        or a top-level one."""
         return sorted(
             receiver for receiver in self.returns.get(function, ())
-            if receiver in self.own and self.scope.get(receiver) == function
+            if receiver in self.own and self.scope.get(receiver) in (function, "")
         )
 
     def exports(self, receiver: str) -> list[tuple[str, str]]:
         """(export name, the prefix its routes are under) of a router
         another module can import and mount: a top-level variable's name, and
-        `f()` for a top-level function `f` that binds and returns it, each
+        `f()` for a top-level function `f` that returns it (`factories`), each
         with its own prefix, and a Flask blueprint's each also with
         REPLACED and none."""
         own = self.own.get(receiver)
