@@ -1495,7 +1495,9 @@ def trace_request_flow(
             or a bare path (`"/users/<id>"`), which starts from that path's endpoint
             for every method. A route on a router whose mount its file doesn't show
             is its file's own endpoint, `"<METHOD> ?<path> (<file>)"`
-            (`"GET ?/:id (routes/users.js)"`), reached by that full name only
+            (`"GET ?/:id (routes/users.js)"`), reached by that full name only.
+            A Django route, stored without its path's leading "/", is reached
+            with it too (`"* /orders/"` or `"/orders/"` for `* orders/`)
         cross_repo: If True, cross repository boundaries
 
     Returns:
@@ -1521,7 +1523,8 @@ def trace_request_flow(
     edge = "{id: elementId(r), type: type(r), start: elementId(startNode(r)), end: elementId(endNode(r))}"
     cypher = f"""
     MATCH (start:Endpoint)
-    WHERE (start.name = $endpoint OR ($bare AND start.name ENDS WITH ' ' + $endpoint))
+    WHERE (start.name IN [$endpoint, $django]
+           OR ($bare AND (start.name ENDS WITH ' ' + $endpoint OR start.name ENDS WITH ' ' + $django)))
     {repo_filter}
     WITH collect(start) AS starts
     CALL (starts) {{
@@ -1554,7 +1557,12 @@ def trace_request_flow(
     RETURN [n IN starts | {node}] AS starts, [n IN reached + targets + further | {node}] AS nodes,
         folds, [r IN edges + further_edges | {edge}] AS edges
     """
-    params = {"endpoint": start_endpoint, "bare": not any(ch.isspace() for ch in start_endpoint.strip())}
+    bare = not any(ch.isspace() for ch in start_endpoint.strip())
+    # A Django pattern is stored without its leading "/" (`* orders/`), which
+    # explain_architecture and list_endpoints show (`* /orders/`): either matches.
+    method, _, path = ("", "", start_endpoint.strip()) if bare else start_endpoint.strip().partition(" ")
+    django = f"{method} {path[1:]}".lstrip() if path.startswith("/") else None
+    params = {"endpoint": start_endpoint, "bare": bare, "django": django}
     if not cross_repo:
         params["repo_id"] = repo_id
 
@@ -2361,7 +2369,9 @@ def explain_architecture(
         Dict with services_and_datastores ({service, uses}) and endpoints
         ({endpoints, calls}, only services some endpoint calls), each a
         {count, results, truncated} envelope; past `LIST_ROW_LIMIT` services
-        both are truncated, with a notice
+        both are truncated, with a notice. Each endpoint is named with a
+        leading "/" on its path, as list_endpoints gives its `path` (a Django
+        pattern's added: `* /orders/`); trace_request_flow takes that name
     """
     from devgraph.mcp.tool_plane import _sanitize_deep
 
@@ -2377,6 +2387,8 @@ def explain_architecture(
     LIMIT {LIST_ROW_LIMIT + 1}
     """
     rows, more = _list_query(engine, cypher, {"repo_id": repo_id})
+    for row in rows:
+        row["endpoint_names"] = [_slashed_endpoint_name(name) for name in row["endpoint_names"]]
     services: list[dict[str, Any]] = []
     endpoints: list[dict[str, Any]] = []
     seen_services: set[tuple[Any, ...]] = set()
@@ -2441,6 +2453,15 @@ def list_services(
 ENDPOINT_FRAMEWORKS = ("ASP.NET Core", "Django", "Express", "FastAPI", "Flask", "Go", "Spring")
 #: A method filter: an HTTP method token (`GET`, `PROPFIND`), or "*".
 _ENDPOINT_METHOD = re.compile(r"[A-Z][A-Z-]*|\*")
+
+
+def _slashed_endpoint_name(name: str) -> str:
+    """An Endpoint's name with a leading "/" on its path, as list_endpoints
+    gives its `path`: a Django pattern is stored without one (`* orders/` is
+    `* /orders/`). A route under an unknown mount (`"GET ?/:id (file)"`) is
+    left as it is."""
+    method, _, rest = name.partition(" ")
+    return name if rest.startswith(("/", "?")) else f"{method} /{rest}"
 
 
 def _endpoint_row(row: dict[str, Any]) -> dict[str, Any]:

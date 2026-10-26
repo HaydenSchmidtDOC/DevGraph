@@ -740,7 +740,8 @@ def build_server(
         """Trace the request flow from an endpoint through services, datastores, and queues
         (every node within five hops). start_endpoint is an endpoint name like
         "GET /users/<id>", or a bare path like "/users/<id>" to start from that path's
-        endpoint for every method. A route's handler stub is listed as the one real
+        endpoint for every method (a Django route with or without its path's leading
+        "/"). A route's handler stub is listed as the one real
         function it stands for (the traced route's own when routes share a handler
         name; its calls are followed too), or as itself when it stands for none. Each
         component is {name, labels, repo_id, file, owner}; edges are {type, from, to}
@@ -887,7 +888,9 @@ def build_server(
         """Generate a high-level architectural explanation of the repository (a service
         uses databases, vector stores, queues and caches):
         services_and_datastores ({service, uses}) and endpoints ({endpoints, calls}, only
-        services some endpoint calls), each a {count, results, truncated} envelope."""
+        services some endpoint calls), each a {count, results, truncated} envelope. Each
+        endpoint's path has a leading "/" (a Django pattern's added, as list_endpoints
+        does)."""
         return devgraph_tools.explain_architecture(engine, repo_id, max_results)
 
     @server.tool(annotations=_READ_ONLY)

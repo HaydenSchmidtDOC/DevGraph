@@ -396,7 +396,7 @@ Prefer these over re-reading files when the question is structural:
 | "What breaks if I change X?" | `impact_analysis` (name, not path; test-code dependents come last in each list, with `test_count`, and `include_tests=False` leaves them out; `endpoints` lists the API routes it reaches) |
 | "What breaks across this whole PR/diff?" | `impact_analysis_for_diff` (base_ref/head_ref, both must exist locally — never fetches) |
 | "What does X depend on?" | `get_service_dependencies` (service name), `find_related_files` (function/class name, not path; entries in test code come last in each list, with `test_count`, and `include_tests=False` leaves them out) |
-| "Trace a request from this endpoint through services/datastores" | `trace_request_flow` (endpoint name like `GET /users/<id>`, or a bare path like `/users/<id>` for every method) |
+| "Trace a request from this endpoint through services/datastores" | `trace_request_flow` (endpoint name like `GET /users/<id>`, or a bare path like `/users/<id>` for every method; a Django route with or without its path's leading `/`) |
 | "What changed recently?" | `list_recent_changes` (lists entities touched in the last N commits, most-recent first; filters by optional entity type) |
 | "What's the overall architecture?" | `explain_architecture` (each service's datastores: databases, vector stores, queues and caches), `summarise_repository` (node counts, `cache_count` included) |
 | "Which routes does this service expose?" | `list_endpoints` (filters: `method`, `path_prefix` by whole segments, `framework`, `service`; each route with its handlers and owning service; a route whose mount its file doesn't show has `mounted: false` and a name like `GET ?/:id (routes/users.js)`) |
