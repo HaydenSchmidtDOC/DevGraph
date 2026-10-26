@@ -292,9 +292,12 @@ share a name (three controllers' `list`) share one stub; when each of those
 routes resolved to its own function, the stub is left out the same way,
 `describe_node` on a route lists only its own function, and
 `trace_request_flow` lists the traced route's own (each component carries
-its `file` and `owner`, so same-named ones are told apart). A stub that
+its `file` and `owner`, so same-named ones are told apart). A Spring route
+mapped on an interface resolves to the interface's method and each
+implementing controller's: one method and its overrides, so its stub is left
+out the same way and `trace_request_flow` lists each of them. A stub that
 some route resolved to no single function (its handler wasn't found, or
-several functions qualify) stays visible: `describe_node` and `get_source` mark it
+several unrelated functions qualify) stays visible: `describe_node` and `get_source` mark it
 `unresolved_handler: true` (file null), never folding it into an unrelated
 function of the same name.
 

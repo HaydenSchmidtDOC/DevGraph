@@ -476,15 +476,34 @@ def _fold_target(var: str, out: str = "folded") -> str:
     )
 
 
+def _route_base(endpoint: str, var: str, base: str) -> str:
+    """Cypher predicate: `base` is a real Function of the name of handler stub
+    `var` that Endpoint `endpoint` IMPLEMENTS, and each other real Function
+    or Class of that name it IMPLEMENTS is a method overriding it (its class
+    EXTENDS `base`'s, to four levels): a Spring route mapped on an interface
+    implements the interface's method and each implementing controller's
+    (apis/routes.py `spring_interface_pins`), one handler and its overrides.
+    Methods of unrelated classes are no such set."""
+    return (
+        f"{base}:Function AND {base}.repo_id = {var}.repo_id AND {base}.name = {var}.name AND {base}.file <> '' "
+        f"AND ({endpoint})-[:IMPLEMENTS]->({base}) "
+        f"AND NOT EXISTS {{ MATCH ({endpoint})-[:IMPLEMENTS]->(other) "
+        f"WHERE (other:Function OR other:Class) AND other.repo_id = {var}.repo_id AND other.name = {var}.name "
+        f"AND other.file <> '' AND other <> {base} "
+        f"AND NOT EXISTS {{ (other)<-[:CONTAINS]-(:Class)-[:EXTENDS*1..4]->(:Class)-[:CONTAINS]->({base}) }} }}"
+    )
+
+
 def _shadowed_stub(var: str) -> str:
     """Cypher predicate: `var` is a route's handler stub (a file-less Function)
     that every route implementing it resolved to exactly one real Function or
-    Class of its name (an IMPLEMENTS edge from the same Endpoint). Each route's
-    handler is then that real node, so the stub, which a name shared by
+    Class of its name (an IMPLEMENTS edge from the same Endpoint), or to one
+    method and its overrides (`_route_base`). Each route's handler is then
+    real, so the stub, which a name shared by
     several routes' handlers (three controllers' `list`) makes one node for
     them all, stands for nothing of its own: tools leave it out where they
     would list it beside those handlers. A stub some route resolved to none,
-    or to several, stays visible (an unresolved handler)."""
+    or to several unrelated ones, stays visible (an unresolved handler)."""
     twin = (
         f"(twin:Function OR twin:Class) AND twin.repo_id = {var}.repo_id AND twin.name = {var}.name "
         "AND twin.file <> ''"
@@ -492,7 +511,8 @@ def _shadowed_stub(var: str) -> str:
     return (
         f"({var}:Function AND coalesce({var}.file, '') = '' AND EXISTS {{ ({var})<-[:IMPLEMENTS]-(:Endpoint) }} "
         f"AND NOT EXISTS {{ MATCH ({var})<-[:IMPLEMENTS]-(e:Endpoint) "
-        f"WHERE COUNT {{ MATCH (e)-[:IMPLEMENTS]->(twin) WHERE {twin} }} <> 1 }})"
+        f"WHERE COUNT {{ MATCH (e)-[:IMPLEMENTS]->(twin) WHERE {twin} }} <> 1 "
+        f"AND NOT EXISTS {{ MATCH (base:Function) WHERE {_route_base('e', var, 'base')} }} }})"
     )
 
 
@@ -1542,8 +1562,9 @@ def trace_request_flow(
         edges with it, and the flow goes on from the Function's calls (four
         more hops): the one Function (or Class) of its name the traced endpoint
         IMPLEMENTS too, when a name several routes' handlers share makes the
-        stub theirs together, else `_fold_target`'s; a stub that folds into
-        none stays listed as it is.
+        stub theirs together (or the method the others it IMPLEMENTS
+        override: a Spring interface's, `_route_base`), else
+        `_fold_target`'s; a stub that folds into none stays listed as it is.
 
     Raises:
         ToolError: no endpoint has that name or path.
@@ -1581,7 +1602,16 @@ def trace_request_flow(
               AND twin.file <> ''
             RETURN collect(DISTINCT twin) AS own
         }}
-        WITH raw, CASE WHEN size(own) = 1 THEN own[0] ELSE folded END AS folded WHERE folded IS NOT NULL
+        CALL (raw, starts) {{
+            UNWIND starts AS s
+            MATCH (s)-[:IMPLEMENTS]->(raw)
+            WHERE raw:Function AND coalesce(raw.file, '') = ''
+            MATCH (s)-[:IMPLEMENTS]->(base:Function)
+            WHERE {_route_base("s", "raw", "base")}
+            RETURN collect(DISTINCT base) AS bases
+        }}
+        WITH raw, CASE WHEN size(own) = 1 THEN own[0] WHEN size(bases) = 1 THEN bases[0] ELSE folded END AS folded
+        WHERE folded IS NOT NULL
         RETURN collect({{stub: elementId(raw), target: elementId(folded)}}) AS folds, collect(DISTINCT folded) AS targets
     }}
     CALL (targets) {{
