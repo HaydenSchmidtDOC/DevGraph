@@ -451,14 +451,37 @@ def _fold_target(var: str, out: str = "folded") -> str:
     )
 
 
+def _shadowed_stub(var: str) -> str:
+    """Cypher predicate: `var` is a route's handler stub (a file-less Function)
+    that every route implementing it resolved to exactly one real Function or
+    Class of its name (an IMPLEMENTS edge from the same Endpoint). Each route's
+    handler is then that real node, so the stub, which a name shared by
+    several routes' handlers (three controllers' `list`) makes one node for
+    them all, stands for nothing of its own: tools leave it out where they
+    would list it beside those handlers. A stub some route resolved to none,
+    or to several, stays visible (an unresolved handler)."""
+    twin = (
+        f"(twin:Function OR twin:Class) AND twin.repo_id = {var}.repo_id AND twin.name = {var}.name "
+        "AND twin.file <> ''"
+    )
+    return (
+        f"({var}:Function AND coalesce({var}.file, '') = '' AND EXISTS {{ ({var})<-[:IMPLEMENTS]-(:Endpoint) }} "
+        f"AND NOT EXISTS {{ MATCH ({var})<-[:IMPLEMENTS]-(e:Endpoint) "
+        f"WHERE COUNT {{ MATCH (e)-[:IMPLEMENTS]->(twin) WHERE {twin} }} <> 1 }})"
+    )
+
+
 def _search_branches(labels: tuple[str, ...], where: str, unwind: bool = False) -> str:
     """`CALL () { ... }` over one MATCH per label, so each can use its label's indexes.
 
     A route's handler stub is left out when it stands for a real Function
-    (`_fold_target`)."""
+    (`_fold_target`), or every route's handler is one (`_shadowed_stub`)."""
     branches = []
     for label in labels:
-        stub = f" {_fold_target('n')}  WITH n, folded WHERE folded IS NULL" if label == "Function" else ""
+        stub = (
+            f" {_fold_target('n')}  WITH n, folded WHERE folded IS NULL AND NOT {_shadowed_stub('n')}"
+            if label == "Function" else ""
+        )
         unwound = "UNWIND $names AS p " if unwind else ""
         branches.append(f"  {unwound}MATCH (n:`{label}`) WHERE {where}{stub} RETURN n")
     return "CALL () {\n" + "\n  UNION\n".join(branches) + "\n}\n"
@@ -599,7 +622,9 @@ _OWNED_LABELS = schema.FILE_SCOPED_LABELS
 _OWNER_OF = "CASE WHEN {v}.file IS NOT NULL THEN coalesce({v}.owner, '') END"
 
 # Each neighbour (`raw`) is listed as the Function it folds into when it is a
-# route's handler stub (`_fold_target`), so a handler is listed once.
+# route's handler stub (`_fold_target`), or left out when each of its routes'
+# handlers is a real Function (`_shadowed_stub`: it is a neighbour of an
+# Endpoint, which lists that Function too), so a handler is listed once.
 _DESCRIBE_GROUPS = f"""
 MATCH (n) WHERE elementId(n) IN $ids
 CALL (n) {{
@@ -611,7 +636,8 @@ CALL (n) {{
   WHERE $direction IN ['both','in'] AND {_DESCRIBE_NEIGHBOUR}
   RETURN 'in' AS dir, type(r) AS rel, raw
 }}
-{_fold_target("raw")}WITH dir, rel, coalesce(folded, raw) AS m
+{_fold_target("raw")}WITH dir, rel, raw, folded WHERE folded IS NOT NULL OR NOT {_shadowed_stub("raw")}
+WITH dir, rel, coalesce(folded, raw) AS m
 WITH dir, rel, count(DISTINCT m) AS total
 ORDER BY dir, rel
 LIMIT {_DESCRIBE_MAX_GROUPS + 1}
@@ -624,7 +650,8 @@ CALL (dir, rel) {{
   }}
   WITH raw WHERE raw.repo_id = $repo_id AND NOT raw:Repository
     AND ($labels IS NULL OR any(l IN labels(raw) WHERE l IN $labels))
-  {_fold_target("raw")}  WITH DISTINCT coalesce(folded, raw) AS m
+  {_fold_target("raw")}  WITH raw, folded WHERE folded IS NOT NULL OR NOT {_shadowed_stub("raw")}
+  WITH DISTINCT coalesce(folded, raw) AS m
   ORDER BY m.name, coalesce(m.file, m.path), m.owner
   LIMIT $cap
   RETURN collect({{
@@ -690,11 +717,11 @@ def _lookup_cypher(labels: tuple[str, ...], declared: frozenset[str]) -> str:
 
     Every label gets a name branch; only declared (provider) labels carry
     `path`, so only they get a path branch. A route's handler stub is left out
-    when it stands for a real Function (`_fold_target`). Labels are validated
-    identifiers.
+    when it stands for a real Function (`_fold_target`, `_shadowed_stub`).
+    Labels are validated identifiers.
     """
     tail = "AND NOT n:Repository AND ($file IS NULL OR $file IN [n.file, n.path, n.source_file])"
-    unfolded = f" {_fold_target('n')}  WITH n, folded WHERE folded IS NULL"
+    unfolded = f" {_fold_target('n')}  WITH n, folded WHERE folded IS NULL AND NOT {_shadowed_stub('n')}"
     body = "\n  UNION\n".join(
         f"  MATCH (n:`{label}`) WHERE n.repo_id = $repo_id AND n.{key} = $name {tail}"
         f"{unfolded if label == 'Function' else ''} RETURN n"
@@ -971,7 +998,7 @@ def _node_ref(row: dict[str, Any]) -> dict[str, Any]:
 def _unresolved_marked(ref: dict[str, Any]) -> dict[str, Any]:
     """A candidate ref, with `unresolved_handler: true` when it is a route's
     handler stub left visible because it folds into no single real Function
-    (`_fold_target`): a file-less Function."""
+    (`_fold_target`, `_shadowed_stub`): a file-less Function."""
     return {**ref, "unresolved_handler": True} if ref["label"] == "Function" and ref.get("file") is None else ref
 
 
@@ -1052,7 +1079,9 @@ def describe_node(
         Function (`_fold_target`: the one Function its endpoint's handler
         reference resolved to, or else the one of its name in its route file) is not
         matched, is listed as that Function among neighbours, and has its
-        relationships folded into that Function's groups; any other stub
+        relationships folded into that Function's groups; a stub several
+        routes share, each of which resolved to its own Function
+        (`_shadowed_stub`), is neither matched nor listed; any other stub
         stays visible (an unresolved handler, file null).
     """
     file = _normalize_file(file)
@@ -1471,17 +1500,24 @@ def trace_request_flow(
 
     Returns:
         Dict with `components` (the start endpoints and every node within five
-        hops, each {name, labels, repo_id}) and `edges` ({type, from, to} per
+        hops, each {name, labels, repo_id, file, owner}: file null and owner
+        left out for a node with no file) and `edges` ({type, from, to} per
         relationship, `from`/`to` naming its components). A route's handler
-        stub that folds into a real Function (`_fold_target`) is listed as that
-        Function, its edges with it, and the flow goes on from the Function's
-        calls (four more hops); a stub that folds into none stays listed as it is.
+        stub that folds into a real Function is listed as that Function, its
+        edges with it, and the flow goes on from the Function's calls (four
+        more hops): the one Function (or Class) of its name the traced endpoint
+        IMPLEMENTS too, when a name several routes' handlers share makes the
+        stub theirs together, else `_fold_target`'s; a stub that folds into
+        none stays listed as it is.
 
     Raises:
         ToolError: no endpoint has that name or path.
     """
     repo_filter = _cross_scope("start", "AND") if cross_repo else "AND start.repo_id = $repo_id"
-    node = "{id: elementId(n), name: n.name, labels: labels(n), repo_id: n.repo_id}"
+    node = (
+        "{id: elementId(n), name: n.name, labels: labels(n), repo_id: n.repo_id, file: n.file, owner: "
+        + _OWNER_OF.format(v="n") + "}"
+    )
     edge = "{id: elementId(r), type: type(r), start: elementId(startNode(r)), end: elementId(endNode(r))}"
     cypher = f"""
     MATCH (start:Endpoint)
@@ -1494,10 +1530,19 @@ def trace_request_flow(
         UNWIND rels AS r
         RETURN collect(DISTINCT node) AS reached, collect(DISTINCT r) AS edges
     }}
-    CALL (reached) {{
+    CALL (reached, starts) {{
         UNWIND reached AS raw
         {_fold_target("raw")}
-        WITH raw, folded WHERE folded IS NOT NULL
+        CALL (raw, starts) {{
+            UNWIND starts AS s
+            MATCH (s)-[:IMPLEMENTS]->(raw)
+            WHERE raw:Function AND coalesce(raw.file, '') = ''
+            MATCH (s)-[:IMPLEMENTS]->(twin)
+            WHERE (twin:Function OR twin:Class) AND twin.repo_id = raw.repo_id AND twin.name = raw.name
+              AND twin.file <> ''
+            RETURN collect(DISTINCT twin) AS own
+        }}
+        WITH raw, CASE WHEN size(own) = 1 THEN own[0] ELSE folded END AS folded WHERE folded IS NOT NULL
         RETURN collect({{stub: elementId(raw), target: elementId(folded)}}) AS folds, collect(DISTINCT folded) AS targets
     }}
     CALL (targets) {{
@@ -1521,7 +1566,7 @@ def trace_request_flow(
     nodes: dict[str, dict[str, Any]] = {}
     for n in row["starts"] + row["nodes"]:
         if n["id"] not in fold:
-            nodes.setdefault(n["id"], {k: n[k] for k in ("name", "labels", "repo_id")})
+            nodes.setdefault(n["id"], _located({k: n[k] for k in ("name", "labels", "repo_id", "file", "owner")}))
     edges: dict[tuple[str, str, str], dict[str, Any]] = {}
     for e in row["edges"]:
         start, end = fold.get(e["start"], e["start"]), fold.get(e["end"], e["end"])
@@ -2858,7 +2903,7 @@ def get_source(
     WHERE (n:Function OR n:Class) AND {match}
     {repo_filter}
     AND ($file IS NULL OR n.file = $file)
-    {_fold_target("n")}WITH n, folded WHERE folded IS NULL
+    {_fold_target("n")}WITH n, folded WHERE folded IS NULL AND NOT {_shadowed_stub("n")}
     RETURN n.name as name, labels(n) as labels, n.repo_id as repo_id,
            n.file as file, {_OWNER_OF.format(v="n")} as owner, n.start_line as start_line, n.end_line as end_line,
            n.docstring_full as docstring_full

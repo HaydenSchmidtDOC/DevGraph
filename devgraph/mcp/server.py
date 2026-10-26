@@ -741,9 +741,10 @@ def build_server(
         (every node within five hops). start_endpoint is an endpoint name like
         "GET /users/<id>", or a bare path like "/users/<id>" to start from that path's
         endpoint for every method. A route's handler stub is listed as the one real
-        function it stands for (whose calls are followed too), or as itself when it
-        stands for none; edges are {type, from, to} between listed components. An
-        unknown endpoint is an error with similar names."""
+        function it stands for (the traced route's own when routes share a handler
+        name; its calls are followed too), or as itself when it stands for none. Each
+        component is {name, labels, repo_id, file, owner}; edges are {type, from, to}
+        between listed components. An unknown endpoint is an error with similar names."""
         return devgraph_tools.trace_request_flow(engine, repo_id, start_endpoint, cross_repo)
 
     @server.tool(annotations=_READ_ONLY)
@@ -1018,8 +1019,9 @@ def build_server(
         its repo-relative path or id; a method may be named with its class, "A.save" or
         "A::save". An ambiguous name returns candidates; call again with label, file and
         owner. A route handler answers as its real function, with its stub's
-        relationships folded in when the stub provably stands for it; a stub that
-        doesn't is marked unresolved_handler. A code symbol's ref carries owner (the classes or functions it is declared
+        relationships folded in when the stub provably stands for it; a stub routes
+        share because their handlers share a name is left out when each route resolved
+        to its own function; any other stub is marked unresolved_handler. A code symbol's ref carries owner (the classes or functions it is declared
         in, "" at the top level), which picks it from a same-named one in its file. Each
         ref in the result is the next call's
         arguments. One hop per call, at most 50 neighbours per type; direction,

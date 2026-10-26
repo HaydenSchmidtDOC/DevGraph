@@ -287,9 +287,14 @@ only function of that name in the route's own file. A folded stub is left out
 of `search_component`, `get_source` and `describe_node`, neighbour lists show
 the function in its place, `describe_node` on the function includes the
 stub's relationships, and `trace_request_flow` lists the function (and
-follows its calls) with the stub's edges moved to it. A stub that stands for
-no single function (its handler wasn't found, or several functions qualify)
-stays visible: `describe_node` and `get_source` mark it
+follows its calls) with the stub's edges moved to it. Routes whose handlers
+share a name (three controllers' `list`) share one stub; when each of those
+routes resolved to its own function, the stub is left out the same way,
+`describe_node` on a route lists only its own function, and
+`trace_request_flow` lists the traced route's own (each component carries
+its `file` and `owner`, so same-named ones are told apart). A stub that
+some route resolved to no single function (its handler wasn't found, or
+several functions qualify) stays visible: `describe_node` and `get_source` mark it
 `unresolved_handler: true` (file null), never folding it into an unrelated
 function of the same name.
 
