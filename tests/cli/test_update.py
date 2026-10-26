@@ -1,6 +1,6 @@
 """Tests for `devgraph update`: the git target, the reinstall command, and the tray restart."""
 
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 
 import pytest
@@ -88,6 +88,7 @@ def update_env(tmp_path, monkeypatch):
     monkeypatch.setattr(cli_main, "resolve_venv_python", lambda: Path("/venv/bin/python"))
     monkeypatch.setattr(cli_main, "get_settings", lambda: SimpleNamespace(registry_db_path=tmp_path / "r.sqlite3"))
     monkeypatch.setattr(cli_main, "_tray_liveness_text", lambda settings: "running")
+    monkeypatch.setattr(cli_main, "_running_from_windows_launcher", lambda: False)
     monkeypatch.setattr(cli_main, "_reinstall_command", lambda venv, python: ["/usr/bin/uv", "sync", "--extra", "dev"])
 
 
@@ -182,7 +183,12 @@ def test_update_not_run_through_the_exe_does_not_hand_off(update_env, monkeypatc
 def test_the_launcher_is_recognised_by_argv0(monkeypatch, argv0, has_exe, expected):
     monkeypatch.setattr(cli_main.os, "name", "nt")
     monkeypatch.setattr(cli_main.sys, "argv", [argv0, "update"])
-    monkeypatch.setattr(cli_main.Path, "is_file", lambda self: has_exe)
+
+    class _FakePath(PurePosixPath):
+        def is_file(self):
+            return has_exe
+
+    monkeypatch.setattr(cli_main, "Path", _FakePath)
     assert cli_main._running_from_windows_launcher() is expected
 
 
