@@ -211,10 +211,14 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: `include_router(prefix=)`, Flask `Blueprint(url_prefix=)` and
 #: `register_blueprint(url_prefix=)`), a router another file mounts named by
 #: those mounts (apis/routes.py MountTable) and one mounted nowhere the file
-#: shows an Endpoint of its own file (`unmounted_endpoint`); and a compose
+#: shows an Endpoint of its own file (`unmounted_endpoint`); a compose
 #: service's build context resolved from the compose file's folder, the
 #: repository root (`build: .` at the root, `context: ..` one level down)
-#: owning every file no deeper context claims.
+#: owning every file no deeper context claims; and a Django class-based view's
+#: route (`View.as_view()`, DRF's `APIView.as_view()` and a ViewSet's
+#: `as_view({...})`) IMPLEMENTS its Class and the request-handling methods
+#: of it (apis/extractor.py `_django_implements`), not a Function of the
+#: class's name.
 #: An index stamped lower, or not at all, is rescanned automatically.
 INDEX_FORMAT = 20
 
@@ -2055,9 +2059,10 @@ def _docs_note_referrers(
 
 def _handler_stub_referrers(engine: GraphEngine, repo_id: str, added: set[tuple[str, str]]) -> set[str]:
     """Route files whose Endpoint IMPLEMENTS a handler that only existed as
-    a file-less stub until the batch added a real Function of that name.
-    One graph lookup, only when the batch added Functions."""
-    functions = sorted(name for label, name in added if label == "Function")
+    a file-less stub until the batch added a real Function (or, for a
+    Django class-based view, Class) of that name. One graph lookup, only
+    when the batch added Functions or Classes."""
+    functions = sorted({name for label, name in added if label in ("Function", "Class")})
     if not functions:
         return set()
     return engine.find_handler_stub_sources(repo_id, functions)

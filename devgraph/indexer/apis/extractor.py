@@ -193,6 +193,7 @@ class _Routes:
         self.decorated: list[tuple[Node, str, str]] = []  # (decorator call, handler, handler owner)
         self.calls: list[Node] = []
         self.local: dict[str, list[tuple[str, str, str | None]]] = {}  # router -> its (mounted on, framework, prefix)
+        self.classes: set[str] = set()  # the file's top-level classes
         # Iterative, in source order: a deeply nested expression (3,000 `+`
         # terms) is read on any thread's stack.
         pending: list[tuple[Node, str, str | None, str]] = [(root, "Module", None, "")]
@@ -248,6 +249,8 @@ class _Routes:
                         self.decorated.append((target, _text(handler, source), member_owner(label, name, owner)))
         if node.type in ("class_definition", "function_definition"):
             name_node = node.child_by_field_name("name")
+            if name_node is not None and node.type == "class_definition" and label == "Module":
+                self.classes.add(_text(name_node, source))
             if name_node is not None:
                 owner = member_owner(label, name, owner)
                 label = "Class" if node.type == "class_definition" else "Function"
@@ -371,11 +374,14 @@ class _Routes:
             return [variant for each in names for variant in ((each, own), (each + REPLACED, ""))]
         return [(each, own) for each in names]
 
-    def django_routes(self) -> list[tuple[str, str, str]]:
-        """(pattern, view, the view as written) per Django `path(...)`/
-        `re_path(...)` call whose pattern is a literal and whose view is a
-        name (`views.search` is `search`) or a class-based view's
-        `as_view()` (the class)."""
+    def django_routes(self) -> list[tuple[str, str, str, tuple[str, ...] | None]]:
+        """(pattern, view, the view as written, its methods) per Django
+        `path(...)`/`re_path(...)` call whose pattern is a literal and whose
+        view is a name (`views.search` is `search`, methods None) or a
+        class-based view's `as_view()` (the class): its methods are the
+        names of the class's methods the route can call, Django's HTTP
+        method handlers (`get`, `post`, ...), or for a DRF ViewSet's
+        `as_view({"get": "list"})` the actions its literal mapping names."""
         found = []
         for call in self.calls:
             func = call.child_by_field_name("function")
@@ -386,15 +392,32 @@ class _Routes:
             positional, _keywords = _arguments(call)
             pattern = _literal(positional[0], self.source) if len(positional) >= 2 else None
             view = positional[1] if len(positional) >= 2 else None
+            methods = None
             if view is not None and view.type == "call":  # `ArticleView.as_view()`
                 inner = view.child_by_field_name("function")
                 obj = inner.child_by_field_name("object") if inner is not None and inner.type == "attribute" else None
-                view = obj if inner is not None and _text(inner, self.source).endswith(".as_view") else None
+                as_view = inner is not None and _text(inner, self.source).endswith(".as_view")
+                methods = self._view_methods(view) if as_view else None
+                view = obj if as_view else None
             if pattern is None or view is None or view.type not in ("identifier", "attribute"):
                 continue
             written = _text(view, self.source)
-            found.append((pattern, written.rsplit(".", 1)[-1], written))
+            found.append((pattern, written.rsplit(".", 1)[-1], written, methods))
         return found
+
+    def _view_methods(self, as_view: Node) -> tuple[str, ...]:
+        """The methods an `as_view(...)` call routes to: a DRF ViewSet's
+        literal `{"get": "list", ...}` mapping's actions, else Django's
+        HTTP method handlers."""
+        positional, keywords = _arguments(as_view)
+        mapping = positional[0] if positional else keywords.get("actions")
+        if mapping is not None and mapping.type == "dictionary":
+            actions = [
+                _literal(pair.child_by_field_name("value"), self.source)
+                for pair in mapping.named_children if pair.type == "pair"
+            ]
+            return tuple(dict.fromkeys(action for action in actions if action))
+        return _HTTP_METHOD_HANDLERS
 
 
 def _imported_router(node: Node, source: bytes, bindings) -> tuple[str, list[str]] | None:
@@ -421,15 +444,32 @@ def _imported_router(node: Node, source: bytes, bindings) -> tuple[str, list[str
     return None
 
 
-def _django_implements(endpoint_id: str, view: str, written: str, bindings) -> list[Relationship]:
-    """A Django route's IMPLEMENTS edges: the file-less handler stub, and the
+#: The methods of a Django (or DRF `APIView`) class-based view that handle
+#: a request, by its method: `View.http_method_names`.
+_HTTP_METHOD_HANDLERS = ("get", "post", "put", "patch", "delete", "head", "options", "trace")
+
+
+def _django_implements(
+    endpoint_id: str, view: str, written: str, bindings, methods: tuple[str, ...] | None = None,
+    filename: str = "", classes: frozenset[str] | set[str] = frozenset(),
+) -> tuple[str, list[Relationship]]:
+    """A Django route's view name and IMPLEMENTS edges: the file-less handler
+    stub (named as the view is where it is defined: a from-import's alias
+    is the name it imports), and the
     view in the module it is imported from, as a top-level function of
     that module's candidate files (python/resolve.py): `views.search` with
     `from . import views` is `<dir>/views.py`'s `search`, a from-imported
-    `search` its module's. A view read off a module nothing imports
-    links nothing but the stub; a bare name nothing imports (a view of the
-    file itself, a star import's) links every one of its name, as before."""
+    `search` its module's. A class-based view (`methods` not None) is the
+    top-level Class there instead, with its `methods` there (owner the
+    class) that it defines itself or inherits from a class of its file; a
+    bare class-based view nothing imports that is a top-level class of the
+    route's own `filename` (one of its `classes`) is that file's. A view
+    read off a module nothing imports links nothing but the stub; any other
+    bare name nothing imports (a star import's, a function of the file
+    itself) links every function (or class) of its name, as before, and
+    no method."""
     head = written.split(".")[0] if "." in written else None
+    label = "Function" if methods is None else "Class"
     pins: list[str] | None = None
     if head is not None:
         receiver = written.rsplit(".", 1)[0] if written.count(".") == 1 else None
@@ -443,17 +483,22 @@ def _django_implements(endpoint_id: str, view: str, written: str, bindings) -> l
             pins = []  # unresolved: the stub alone
     elif (symbol := bindings.symbols.get(written)) is not None:
         view, pins = symbol.name, symbol.module.files()
-    if pins is None:
-        return [Relationship(
+    elif methods is not None and written in classes:
+        pins = [filename]
+
+    def implements(target_label, target_name, to_file=None, to_owner=None):
+        return Relationship(
             source_label="Endpoint", source_name=endpoint_id, relationship_type="IMPLEMENTS",
-            target_label="Function", target_name=view,
-        )]
-    return [
-        Relationship(
-            source_label="Endpoint", source_name=endpoint_id, relationship_type="IMPLEMENTS",
-            target_label="Function", target_name=view, to_file=pin, to_owner="" if pin else None,
+            target_label=target_label, target_name=target_name, to_file=to_file, to_owner=to_owner,
         )
-        for pin in ["", *dict.fromkeys(pins)]
+
+    if pins is None:
+        if methods is None:
+            return view, [implements("Function", view)]
+        return view, [implements("Function", view, ""), implements("Class", view)]
+    pins = list(dict.fromkeys(pins))
+    return view, [implements("Function", view, ""), *(implements(label, view, pin, "") for pin in pins)] + [
+        implements("Function", method, pin, view) for pin in pins for method in methods or ()
     ]
 
 
@@ -564,10 +609,13 @@ class APIExtractor:
                     for name, under in routes.exports(parent)
                 }
         result.route_mounts = sorted(route_mounts) or None
-        for pattern, view, written in django:
+        for pattern, view, written, methods in django:
+            view, implements = _django_implements(
+                f"* {pattern}", view, written, bindings, methods, filename, routes.classes,
+            )
             # Django's urls.py names no HTTP method (the view handles each).
             self._add(result, "Django", "*", pattern, view, filename, "view")
-            result.relationships += _django_implements(f"* {pattern}", view, written, bindings)
+            result.relationships += implements
         return result
 
     def _add(

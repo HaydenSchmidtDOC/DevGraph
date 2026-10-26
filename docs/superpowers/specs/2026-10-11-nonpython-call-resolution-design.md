@@ -1185,6 +1185,53 @@ A repository with no routes costs the same. What remains is linear in the
 routes (their Endpoint and stub claims, about 5.5 ms per label per route
 file, and their edges).
 
+### Django class-based views (index format 20)
+
+A Django route to a class-based view (`views.OrderView.as_view()`) had
+its `IMPLEMENTS` go to a `Function` named after the class, pinned to the
+view's module at owner "": no node matches that, so the route implemented
+only its file-less stub, which `_fold_target` could not fold and every
+answer showed as an unresolved handler beside the `Class`
+(`describe_node("OrderView")` was ambiguous between the two).
+
+- **The Class.** A view written as `X.as_view(...)` is the top-level
+  `Class` `X` (owner "") of the module it is imported from, pinned as a
+  function view is (graph-accuracy spec R3): `views.X` with `from . import
+  views` is `<dir>/views.py`'s or `views/__init__.py`'s, a from-imported
+  `X` its module's (under the name it imports, an alias's too, which the
+  stub now also takes). A bare name nothing imports is the route file's
+  own top-level class when it defines one, pinned to that file; any other
+  (a star import's) links every `Class` of its name, unpinned, and the
+  stub.
+- **Its HTTP method handlers.** The same pins also link the class's
+  methods (owner the class) that serve the route: Django's
+  `View.http_method_names` (`get`, `post`, `put`, `patch`, `delete`,
+  `head`, `options`, `trace`) for a plain `as_view()`, or the actions a
+  DRF ViewSet's literal `as_view({"get": "list", ...})` mapping names. A
+  method links when the class defines it or inherits it from a class of
+  its own file (an owned pin's heir keys, index format 18); one inherited
+  from Django itself or from another file has no node of the class and
+  links nothing. An unpinned bare-name view links no method: an unpinned
+  owner would match every class's. The Class alone would leave
+  `trace_request_flow` to reach the code through `CONTAINS`; the methods
+  say which code serves a request and put it in `list_endpoints`.
+- **Folding.** `_fold_target` folds a stub into the one Function or Class
+  of its name that its Endpoint also implements, else the one Function or
+  Class of its name in its route files. `describe_node` of the Class lists its stubs'
+  relationships as its own (`_FOLDED_STUBS`), and `list_endpoints` gives
+  each handler's `label`.
+- **DRF.** `APIView.as_view()` is the same shape. A ViewSet registered on
+  a router (`router.register("items", ItemViewSet)`, then
+  `path("", include(router.urls))`) is not read: its URLs come from the
+  router at run time, so it has no Endpoint.
+- **Incremental equals fresh.** The pins are recorded in `name_refs` like
+  every pinned route edge, so a batch adding the class or a method
+  relinks it, and a route file whose stub's name a batch adds as a Class
+  is re-read as for a Function (`_handler_stub_referrers`).
+  `test_extract_coverage_live.py` renames the class, moves it into a
+  package and back, deletes and restores its module and adds a method,
+  comparing with a fresh scan each time.
+
 ## Datastore clients beyond Python (index format 18)
 
 `Service -USES->` a datastore came from Python files alone, so

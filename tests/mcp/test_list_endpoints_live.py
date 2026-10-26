@@ -98,7 +98,8 @@ def test_lists_every_route_with_its_handler_and_service(engine, repo):
     by_name = {row["name"]: row for row in result["results"]}
     assert by_name["GET /api/orders"] == {
         "name": "GET /api/orders", "method": "GET", "path": "/api/orders", "mounted": True, "framework": "Express",
-        "files": ["shop/app.ts"], "handlers": [{"name": "listOrders", "file": "shop/orders.ts", "owner": ""}],
+        "files": ["shop/app.ts"],
+        "handlers": [{"label": "Function", "name": "listOrders", "file": "shop/orders.ts", "owner": ""}],
         "services": ["shop"], "repo_id": repo,
     }
     assert by_name["GET /api/users"]["framework"] == "FastAPI"
@@ -109,7 +110,7 @@ def test_lists_every_route_with_its_handler_and_service(engine, repo):
     assert by_name["GET /health"]["handlers"] == []
     loose = by_name["GET ?/:id (shop/loose.ts)"]
     assert (loose["method"], loose["path"], loose["mounted"]) == ("GET", "/:id", False)
-    assert loose["handlers"] == [{"name": "show", "file": "shop/loose.ts", "owner": ""}]
+    assert loose["handlers"] == [{"label": "Function", "name": "show", "file": "shop/loose.ts", "owner": ""}]
 
 
 def test_filters(engine, repo):

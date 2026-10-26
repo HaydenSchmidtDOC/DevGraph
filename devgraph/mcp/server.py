@@ -899,8 +899,8 @@ def build_server(
         max_results: int = 15,
     ) -> dict[str, Any]:
         """List API endpoints (routes); returns {count, results, truncated}, each result
-        {name, method, path, mounted, framework, files, handlers ({name, file, owner}),
-        services, repo_id}. Filters: method ("GET", "*" for an every-method route),
+        {name, method, path, mounted, framework, files, handlers ({label, name, file, owner}:
+        a Function, or a Django class-based view's Class), services, repo_id}. Filters: method ("GET", "*" for an every-method route),
         path_prefix (whole segments: "/api" matches "/api/users", not "/apis"), framework
         (ASP.NET Core, Django, Express, FastAPI, Flask, Go, Spring) and service (the compose
         service an endpoint CALLS). A route whose mount its file doesn't show has mounted
