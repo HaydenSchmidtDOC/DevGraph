@@ -2809,7 +2809,8 @@ def blame_component(
     Args:
         engine: GraphEngine instance
         repo_id: Repository ID
-        component_name: Name of the Module (file) to look up commit history for
+        component_name: Name of the Module (file) to look up commit history for:
+            its repo-relative path, `./` and `\\` separators allowed
         cross_repo: If True, search across repos
         max_results: Maximum number of results to return in the envelope
 
@@ -2822,6 +2823,7 @@ def blame_component(
     Raises:
         ToolError: no file (Module) has that path.
     """
+    component_name = _normalize_file(component_name)
     repo_filter = _cross_scope("c", "AND") if cross_repo else "AND c.repo_id = $repo_id"
     cypher = f"""
     MATCH (c:Commit)-[:MODIFIES]->(m:Module {{name: $component_name}})
