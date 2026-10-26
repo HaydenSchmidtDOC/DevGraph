@@ -206,3 +206,17 @@ def test_a_nested_compose_files_parent_context_owns_the_repository(
     index_paths(engine, repo_id, tmp_path, {moved})
     incremental_equals_fresh(engine, repo_id, tmp_path)
     assert _uses(engine, repo_id) == [("shop", "Redis")]
+
+
+def test_dockerfile_in_a_folder_of_a_service_context_keeps_the_context():
+    """`context: ./api` with `dockerfile: docker/Dockerfile`: the service's
+    source is its own context, not the folder holding its Dockerfile."""
+    compose = """\
+        services:
+          api:
+            build:
+              context: ./api
+              dockerfile: docker/Dockerfile
+    """
+    assert _context(compose, "compose.yml") == "api"
+    assert _context(compose, "deploy/compose.yml") == "deploy/api"
