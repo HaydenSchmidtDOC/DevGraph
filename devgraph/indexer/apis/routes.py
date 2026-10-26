@@ -28,6 +28,8 @@ file mounts is then named by those mounts (`MountTable`, below).
 
 from __future__ import annotations
 
+import re
+
 from devgraph.graph.schema import scoped_pin
 from devgraph.indexer.calls import call_rows
 from devgraph.indexer.common import ExtractionResult, GraphNode, GraphRelationship, owned_pin
@@ -106,26 +108,55 @@ def add_route(
     )
 
 
+#: A Spring property placeholder in a mapping: `${name}` or `${name:default}`.
+_SPRING_PLACEHOLDER = re.compile(r"\$\{([^}:]*)(?::([^}]*))?\}")
+
+
+def spring_path(path: str, prefix: bool = False) -> tuple[str, bool] | None:
+    """A Spring mapping path with its property placeholders read: (the
+    path, whether its prefix is known). A placeholder with a default is
+    that default (`${api.base:/v2}` is `/v2`, `${api.base:}` ""); one with
+    none (`${api.base}`) is a prefix the code doesn't show: a whole
+    type-level path (`prefix`) is then unknown ("", False), and a method's
+    leading one leaves the rest under an unknown prefix; anywhere else in
+    a method's path it is a dynamic path (None)."""
+    parts, at, known = [], 0, True
+    for match in _SPRING_PLACEHOLDER.finditer(path):
+        parts.append(path[at:match.start()])
+        at = match.end()
+        if match.group(2) is not None:
+            parts.append(match.group(2))
+        elif prefix:
+            return "", False
+        elif match.start() == 0:
+            known = False
+        else:
+            return None
+    return "".join(parts) + path[at:], known
+
+
 def spring_routes(
     class_annotations: dict[str, dict[str, list[str] | None]],
     method_annotations: dict[str, dict[str, list[str] | None]],
     interface: bool = False,
-) -> list[tuple[str, str]]:
-    """The (method, path) pairs a Spring controller method maps, or with
-    `interface` an interface's method (the OpenAPI-generator pattern, see
-    `spring_interface_pins`; a Feign client's are no routes).
+) -> list[tuple[str, str, bool]]:
+    """The (method, path, mounted) triples a Spring controller method maps,
+    or with `interface` an interface's method (the OpenAPI-generator
+    pattern, see `spring_interface_pins`; a Feign client's are no routes).
 
     Each annotation is given as its arguments: `value` (the positional one,
     or `value=`/`path=`) as its literal strings, None when one of them is
     not a literal, absent when not given; `method` as the RequestMethod
     names. The class's RequestMapping paths prefix the method's; a
-    RequestMapping with no `method` maps every method ("*")."""
+    RequestMapping with no `method` maps every method ("*"). A property
+    placeholder is read by `spring_path`: `mounted` False is a route under
+    a prefix it leaves unknown (`unmounted_endpoint`)."""
     if interface and "FeignClient" in class_annotations:
         return []  # a client's declaration of another service's routes
     if not interface and not SPRING_CONTROLLERS & set(class_annotations):
         return []
     prefixes = class_annotations.get("RequestMapping", {}).get("value", [""])
-    routes: list[tuple[str, str]] = []
+    routes: list[tuple[str, str, bool]] = []
     for name, http_method in SPRING_MAPPINGS.items():
         if name not in method_annotations:
             continue
@@ -134,7 +165,15 @@ def spring_routes(
         if prefixes is None or paths is None:
             continue  # a dynamic path
         methods = [http_method] if http_method else sorted(args.get("method") or ["*"])
-        routes += [(each, join_route(prefix, path)) for prefix in prefixes for path in paths for each in methods]
+        for prefix in prefixes:
+            outer = spring_path(prefix, prefix=True)
+            for path in paths:
+                inner = spring_path(path)
+                if inner is None:
+                    continue  # a dynamic path
+                # A method's unknown leading part hides the class's prefix too.
+                full = join_route(outer[0], inner[0]) if inner[1] else join_route(inner[0])
+                routes += [(each, full, outer[1] and inner[1]) for each in methods]
     return routes
 
 

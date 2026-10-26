@@ -234,7 +234,8 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: handler resolved as a call to it (another file's class's method), and
 #: ASP.NET `MapMethods` routes; Spring mappings declared on an interface,
 #: implemented by the methods of the controllers implementing it (their
-#: `mkeys`, apis/routes.py `spring_interface_pins`).
+#: `mkeys`, apis/routes.py `spring_interface_pins`), and a Spring mapping's
+#: property placeholder read as its default (`spring_path`).
 #: An index stamped lower, or not at all, is rescanned automatically.
 INDEX_FORMAT = 21
 

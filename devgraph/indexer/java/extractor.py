@@ -624,9 +624,9 @@ def _spring_routes(
                     pins = spring_interface_pins(
                         file_path, _owner_of(inner), ".".join([*package, _owner_of(inner)])
                     ) if interface else None
-                    for http_method, path in spring_routes(mapped, _annotations(member, source), interface):
+                    for http_method, path, mounted in spring_routes(mapped, _annotations(member, source), interface):
                         add_route(result, repo_id, file_path, "Spring", http_method, path, _text(method, source),
-                                  _owner_of(inner), pins)
+                                  _owner_of(inner), pins, mounted)
                     if SPRING_CONTROLLERS & set(mapped) and "RequestMapping" not in mapped and implemented:
                         keys.setdefault((_text(method, source), _owner_of(inner)), set()).update(
                             spring_implementer_key(name) for each in implemented

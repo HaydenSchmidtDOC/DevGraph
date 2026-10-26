@@ -828,10 +828,13 @@ def _annotations(node: Node, source: bytes) -> dict[str, dict[str, list[str] | N
             elif key in ("value", "path"):
                 literal = all(
                     item.type == "string_literal" and not _text(item, source).startswith('"""')
-                    and all(part.type == "string_content" for part in item.named_children)
+                    and all(part.type == "string_content" or (
+                        part.type == "escape_sequence" and _text(part, source) == "\\$"
+                    ) for part in item.named_children)
                     for item in items
                 )
-                args["value"] = [_text(item, source)[1:-1] for item in items] if literal else None
+                # `"\${api.base:/v2}"`: an escaped `$` is a Spring placeholder's.
+                args["value"] = [_text(item, source)[1:-1].replace("\\$", "$") for item in items] if literal else None
         found[_text(name, source).rsplit(".", 1)[-1]] = args
     return found
 
@@ -885,9 +888,9 @@ def _spring_routes(
                     pins = spring_interface_pins(
                         file_path, _owner_of(inner), ".".join([*package, _owner_of(inner)])
                     ) if interface else None
-                    for http_method, path in spring_routes(mapped, _annotations(member, source), interface):
+                    for http_method, path, mounted in spring_routes(mapped, _annotations(member, source), interface):
                         add_route(result, repo_id, file_path, "Spring", http_method, path, _text(function, source),
-                                  _owner_of(inner), pins)
+                                  _owner_of(inner), pins, mounted)
                     if supertypes:
                         keys.setdefault((_text(function, source), _owner_of(inner)), set()).update(
                             spring_implementer_key(each) for each in supertypes
