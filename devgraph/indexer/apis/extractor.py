@@ -201,9 +201,10 @@ class _Routes:
         self.imports: set[str] = set()  # "FastAPI", "Flask": the frameworks the file imports
         self.decorated: list[tuple[Node, str, str]] = []  # (decorator call, handler, handler owner)
         self.calls: list[Node] = []
+        self.call_scopes: list[str] = []  # per call, the owner a definition beside it has
         self.local: dict[str, list[tuple[str, str, str | None]]] = {}  # router -> its (mounted on, framework, prefix)
         self.classes: set[str] = set()  # the file's top-level classes
-        self.functions: set[str] = set()  # the file's top-level functions
+        self.functions: set[tuple[str, str]] = set()  # the file's functions: (name, owner)
         self.class_methods: dict[str, set[str]] = {}  # top-level class -> the methods it defines
         self.class_bases: dict[str, list[str]] = {}  # top-level class -> its bases as written
         # Iterative, in source order: a deeply nested expression (3,000 `+`
@@ -246,6 +247,7 @@ class _Routes:
                         self.own.pop(target, None)
         elif node.type == "call":
             self.calls.append(node)
+            self.call_scopes.append(member_owner(label, name, owner))
         elif node.type == "return_statement" and label == "Function" and not owner and name is not None:
             value = node.named_children[0] if node.named_children else None
             if value is not None and value.type == "identifier":
@@ -268,10 +270,10 @@ class _Routes:
                     _text(base, source) for base in (bases.named_children if bases is not None else [])
                     if base.type in ("identifier", "attribute")
                 ]
-            elif name_node is not None and label == "Module":
-                self.functions.add(_text(name_node, source))
-            elif name_node is not None and label == "Class" and not owner and name in self.classes:
-                self.class_methods.setdefault(name, set()).add(_text(name_node, source))
+            elif name_node is not None and node.type == "function_definition":
+                self.functions.add((_text(name_node, source), member_owner(label, name, owner)))
+                if label == "Class" and not owner and name in self.classes:
+                    self.class_methods.setdefault(name, set()).add(_text(name_node, source))
             if name_node is not None:
                 owner = member_owner(label, name, owner)
                 label = "Class" if node.type == "class_definition" else "Function"
@@ -320,13 +322,14 @@ class _Routes:
             found += [(framework, method, path, handler, owner, receiver_text) for method in methods]
         return found
 
-    def rule_calls(self) -> list[tuple[str, list[str] | None, str, Node, str]]:
-        """(framework, its methods, path, view, receiver) per `add_url_rule`
+    def rule_calls(self) -> list[tuple[str, list[str] | None, str, Node, str, str]]:
+        """(framework, its methods, path, view, receiver, the call's scope:
+        the owner a definition beside it has) per `add_url_rule`
         and `add_api_route` call on an app or router (`_routing`) whose path
         is a literal and that gives a view; the methods are `methods=`'s
         (`_methods`), None when not given."""
         found = []
-        for call in self.calls:
+        for call, scope in zip(self.calls, self.call_scopes):
             func = call.child_by_field_name("function")
             if func is None or func.type != "attribute":
                 continue
@@ -341,7 +344,9 @@ class _Routes:
             if path is None or view is None or not self._routing(receiver):
                 continue
             given = keywords.get("methods")
-            found.append((framework, None if given is None else _methods(given, self.source), path, view, receiver))
+            found.append((
+                framework, None if given is None else _methods(given, self.source), path, view, receiver, scope,
+            ))
         return found
 
     def view_methods(self, cls: str, seen: frozenset = frozenset()) -> tuple[str, ...] | None:
@@ -565,11 +570,15 @@ def _django_implements(
     ]
 
 
-def _rule_views(view: Node, methods: list[str] | None, routes: _Routes, bindings, filename: str, source: bytes):
+def _rule_views(
+    view: Node, methods: list[str] | None, routes: _Routes, bindings, filename: str, source: bytes, scope: str,
+):
     """(method, handler, its IMPLEMENTS edges from an Endpoint) per route of
     an `add_url_rule`/`add_api_route` view (`_Routes.rule_calls`).
 
-    A function of the file is that file's, as a decorated handler is; any
+    A function of the file the call's scope sees (one defined beside the
+    call, an app factory's nested `index`, else in a scope around it) is
+    that file's of its owner, as a decorated handler is; any
     other name links where `_django_implements` finds it (its imported
     module's). A class-based view's `as_view(...)` (Flask's `MethodView`)
     is its Class and, per method, the method's handler (`get` for GET);
@@ -591,9 +600,11 @@ def _rule_views(view: Node, methods: list[str] | None, routes: _Routes, bindings
     if view.type not in ("identifier", "attribute"):
         return []
     written = _text(view, source)
-    if not class_view and view.type == "identifier" and written in routes.functions:
+    scopes = [scope.rsplit(".", depth)[0] for depth in range(scope.count(".") + 1)] + [""] if scope else [""]
+    owner = next((each for each in scopes if (written, each) in routes.functions), None)
+    if not class_view and view.type == "identifier" and owner is not None:
         return [
-            (method, written, lambda endpoint: _pinned_implements(endpoint, written, filename, ""))
+            (method, written, lambda endpoint: _pinned_implements(endpoint, written, filename, owner))
             for method in methods or ["GET"]
         ]
 
@@ -679,10 +690,10 @@ class APIExtractor:
              lambda endpoint, handler=handler, owner=owner: _pinned_implements(endpoint, handler, filename, owner))
             for framework, method, path, handler, owner, receiver in routes.decorator_routes()
         ]
-        for framework, methods, path, view, receiver in rules:
+        for framework, methods, path, view, receiver, scope in rules:
             found += [
                 (framework, method, path, receiver, handler, link)
-                for method, handler, link in _rule_views(view, methods, routes, bindings, filename, source)
+                for method, handler, link in _rule_views(view, methods, routes, bindings, filename, source, scope)
             ]
         # A route on a router the file mounts on no app is the file's own
         # (`unmounted_endpoint`); one of a router another module can import
