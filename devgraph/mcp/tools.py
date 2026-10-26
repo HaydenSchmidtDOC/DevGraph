@@ -1724,7 +1724,8 @@ def find_callers(
         {label, file} (file None for a file-less one; repo_id too when cross_repo).
         `routed_by` is a {count, results, truncated} envelope of the Endpoints
         that IMPLEMENTS the target (a route is no caller), each as
-        list_endpoints lists it, ordered by name.
+        list_endpoints lists it, ordered by name, with `target_files` as a
+        caller row has them.
 
     Raises:
         ToolError: no node has that name, or none in `file`.
@@ -1798,7 +1799,9 @@ def find_callers(
         results = [_with_target_files(row, row["target_files"]) for row in results]
     envelope = _capped_envelope(results, more, max_results)
     envelope["test_count"] = tests[0]["tests"] if tests else 0
-    envelope["routed_by"] = _endpoints_envelope(routed_by or {"endpoint_count": 0, "endpoints": []}, max_results)
+    envelope["routed_by"] = _endpoints_envelope(
+        routed_by or {"endpoint_count": 0, "endpoints": []}, max_results, tagged=ambiguous is not None
+    )
     if ambiguous:
         envelope["ambiguous_targets"] = ambiguous
     return envelope
@@ -2122,7 +2125,9 @@ def impact_analysis(
         counts them too. `endpoints` is a {count, results, truncated} envelope of
         the Endpoints that IMPLEMENTS the component or any dependent (a route
         reaches its handler that way, so it is never a dependent; risk_level
-        leaves them out), each as list_endpoints lists it, ordered by name.
+        leaves them out), each as list_endpoints lists it, ordered by name;
+        when each file's targets are traced apart, each also has the
+        `target_files` of the targets it reaches.
 
     Raises:
         ToolError: no node has that name, or none in `file`.
@@ -2198,7 +2203,7 @@ def impact_analysis(
     }
     return {
         **{key: dependents_envelope(rows) for key, rows in lists.items()},
-        "endpoints": _endpoints_envelope(answer_row, max_results),
+        "endpoints": _endpoints_envelope(answer_row, max_results, tagged=True),
         "risk_level": _risk_level(max(row["direct_count"] for row in results)),
         "ambiguous_targets": ambiguous,
     }
@@ -2208,11 +2213,16 @@ def _risk_level(direct_count: int) -> str:
     return "high" if direct_count > 10 else "medium" if direct_count > 3 else "low"
 
 
-def _endpoints_envelope(row: dict[str, Any], max_results: int) -> dict[str, Any]:
+def _endpoints_envelope(row: dict[str, Any], max_results: int, tagged: bool = False) -> dict[str, Any]:
     """A {count, results, truncated} envelope of the Endpoints `_capped_endpoints`
-    read into `row`, each as list_endpoints lists it, ordered by repository and name."""
+    read into `row`, each as list_endpoints lists it, ordered by repository and
+    name; `tagged` adds each one's `target_files` (`_with_target_files`), as
+    the dependents or callers of several same-named targets carry them."""
     shown = sorted(row["endpoints"], key=lambda e: (e["repo_id"], e["name"]))
-    envelope = _envelope([_endpoint_row(e) for e in shown], max_results)
+    rows = [_endpoint_row(e) for e in shown]
+    if tagged:
+        rows = [_with_target_files(r, e["target_files"]) for r, e in zip(rows, shown, strict=True)]
+    envelope = _envelope(rows, max_results)
     envelope["count"] = row["endpoint_count"]
     envelope["truncated"] = row["endpoint_count"] > len(envelope["results"])
     return envelope

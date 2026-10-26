@@ -32,8 +32,9 @@ FILES = {
     # Twelve routes over a.py's helper, two over b.py's.
     "a.py": HEAD + _routes("a", 12, "helper()") + "def helper():\n    return 1\n",
     "b.py": HEAD + _routes("b", 2, "helper()") + "def helper():\n    return 2\n",
-    # One handler under eight routes.
+    # One handler under eight routes, and a same-named one under another.
     "s.py": HEAD + "".join(f'@app.get("/s/{i}")\n' for i in range(8)) + "def shared():\n    return 1\n",
+    "t.py": HEAD + '@app.get("/t/0")\ndef shared():\n    return 2\n',
 }
 
 
@@ -86,6 +87,26 @@ def test_split_targets_count_their_endpoints_together(engine, repo_id, read_rows
 
 def test_find_callers_reads_only_the_routes_it_shows(engine, repo_id, read_rows):
     routed_by = tools.find_callers(engine, repo_id, "shared", max_results=3)["routed_by"]
-    assert routed_by["count"] == 8 and routed_by["truncated"] is True
+    assert routed_by["count"] == 9 and routed_by["truncated"] is True
     assert [row["name"] for row in routed_by["results"]] == ["GET /s/0", "GET /s/1", "GET /s/2"]
     assert _shipped(read_rows, "endpoints") == 3
+
+
+def test_split_targets_tag_each_endpoint_with_its_targets_files(engine, repo_id):
+    result = tools.impact_analysis(engine, repo_id, "helper", max_results=20)
+    tags = {row["name"]: row["target_files"] for row in result["endpoints"]["results"]}
+    assert tags == {
+        **{f"GET /a/{i}": ["a.py"] for i in range(12)}, **{f"GET /b/{i}": ["b.py"] for i in range(2)},
+    }
+    # One target: nothing to tell apart.
+    single = tools.impact_analysis(engine, repo_id, "helper", file="a.py")["endpoints"]["results"]
+    assert not any("target_files" in row for row in single)
+
+
+def test_find_callers_tags_routes_when_targets_are_ambiguous(engine, repo_id):
+    routed_by = tools.find_callers(engine, repo_id, "shared", max_results=20)["routed_by"]["results"]
+    assert {row["name"]: row["target_files"] for row in routed_by} == {
+        **{f"GET /s/{i}": ["s.py"] for i in range(8)}, "GET /t/0": ["t.py"],
+    }
+    one = tools.find_callers(engine, repo_id, "shared", file="t.py")["routed_by"]["results"]
+    assert [row["name"] for row in one] == ["GET /t/0"] and "target_files" not in one[0]

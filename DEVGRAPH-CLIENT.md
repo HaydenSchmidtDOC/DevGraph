@@ -319,6 +319,8 @@ Each is a `{count, results, truncated}` envelope of rows shaped as
 `list_endpoints` gives them (`name`, `method`, `path`, `mounted`,
 `framework`, `files`, `handlers`, `services`, `repo_id`); `name` is what
 `trace_request_flow` takes. `risk_level` still counts direct dependents only.
+Where dependents or callers carry `target_files` (several same-named
+targets), so does each endpoint.
 
 **Response shape (`count`/`results`/`truncated`)**: `search_component`,
 `find_callers`, `list_services`, `list_endpoints`, `find_related_prs`, `issue_history_for`,
