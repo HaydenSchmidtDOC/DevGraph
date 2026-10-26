@@ -11,6 +11,7 @@ it was first written).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import timezone
 
 from git import Repo
 
@@ -44,7 +45,8 @@ def compute_function_recency(repo: Repo, file_path: str) -> list[FunctionRecency
             FunctionRecency(
                 start_line=start_line,
                 end_line=end_line,
-                last_modified_at=commit.authored_datetime.isoformat(),  # type: ignore[union-attr]
+                # UTC, so the stored strings sort as instants (see extractor.HISTORY_FORMAT).
+                last_modified_at=commit.authored_datetime.astimezone(timezone.utc).isoformat(),  # type: ignore[union-attr]
                 last_modified_by=commit.author.name if commit.author else None,  # type: ignore[union-attr]
             )
         )

@@ -20,6 +20,7 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 from git import GitCommandError, Repo
@@ -36,6 +37,11 @@ CHUNK_ROWS = 1000
 #: How often, at most, a sync offers its batch lock to waiting live
 #: batches (`between_chunks`).
 YIELD_EVERY_S = 0.5
+#: The format of the history a sync writes, stamped on the Repository node
+#: (`history_format`). 1 (unstamped): dates kept their author's UTC offset;
+#: 2 (INDEX_FORMAT 22): dates in UTC, so ISO strings sort as instants. A
+#: graph holding commits of an older format is reconciled by its next sync.
+HISTORY_FORMAT = 2
 
 
 class _Stopped(Exception):
@@ -139,7 +145,7 @@ class GitHistoryExtractor:
                         properties={
                             "message": (commit.message or "").strip(),
                             "author": commit.author.name if commit.author else None,
-                            "authored_date": commit.authored_datetime.isoformat(),
+                            "authored_date": commit.authored_datetime.astimezone(timezone.utc).isoformat(),
                         },
                     )
                 )
@@ -478,6 +484,106 @@ def _sync(
     return len(result.commits), 0
 
 
+def _stamp_history_format(engine, repo_id: str) -> None:
+    engine.run_cypher(
+        "MATCH (r:Repository {repo_id: $repo_id}) SET r.history_format = $version",
+        {"repo_id": repo_id, "version": HISTORY_FORMAT},
+    )
+
+
+def _log_blame_failures(repo_id: str, blame_failures: dict[str, Exception | None]) -> None:
+    failed = sorted(path for path, exc in blame_failures.items() if exc is not None)
+    if failed:
+        # One line per sync: a blobless partial clone fails the blame of every file.
+        logger.warning(
+            f"{repo_id}: git blame failed for {len(failed)} file(s), recency skipped for them "
+            f"(first {failed[0]!r}: {blame_failures[failed[0]]})"
+        )
+
+
+def _history_outdated(engine, repo_id: str) -> bool:
+    """True when the graph holds the repository's commits written in a
+    format older than HISTORY_FORMAT (an upgrade): the next sync migrates
+    them (`_migrate_to_utc`). A graph without its commits needs no
+    migration (its first sync writes the current format)."""
+    rows = engine.run_cypher(
+        "MATCH (r:Repository {repo_id: $repo_id}) "
+        "RETURN coalesce(r.history_format, 1) >= $version "
+        "OR NOT EXISTS { MATCH (:Commit {repo_id: $repo_id}) } AS current",
+        {"repo_id": repo_id, "version": HISTORY_FORMAT},
+    )
+    return bool(rows) and not rows[0]["current"]
+
+
+#: Labels whose git dates (`authored_date`, `created_at`, `last_modified_at`) a migration rewrites.
+_DATED_LABELS = ("Commit", "Module", "Function", "Class")
+
+
+def _utc(value: str | None) -> str | None:
+    """An ISO date string in UTC (one with no offset read as UTC)."""
+    if value is None:
+        return None
+    moment = datetime.fromisoformat(value)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc).isoformat()
+
+
+def _migrate_to_utc(engine, repo: Repo, repo_id: str, pace: _Pacer, blame_failures: dict) -> None:
+    """Rewrite history stored with its authors' UTC offsets (HISTORY_FORMAT
+    1) in UTC, in place: no commit is read from git again, so a capped
+    history stays capped and a long one takes seconds, not a re-walk.
+
+    1. A `.py` file whose commits or recency carry more than one offset may have had
+       its Functions' and Classes' recency picked by the offset strings, not
+       the instants: it is blamed again (overwrite). Found from the offsets,
+       before they are rewritten, so a migration cut short finds it again.
+    2. Every date still not in UTC is rewritten, CHUNK_ROWS nodes at a
+       time, until none is left. Each row converges on its own, so an
+       interrupted migration resumes where it stopped.
+    3. Module recency is aggregated again from the rewritten commits (its
+       min/max were taken over the offset strings).
+
+    `pace` is called between chunks and files; a stop leaves the stamp
+    unset, and the next sync goes on from there."""
+    offsets: dict[str, set[str]] = {}
+    for row in engine.run_cypher(
+        "MATCH (c:Commit {repo_id: $repo_id})-[:MODIFIES]->(m:Module {repo_id: $repo_id}) "
+        "WHERE m.name ENDS WITH '.py' AND c.authored_date IS NOT NULL "
+        "RETURN m.name AS file, collect(DISTINCT right(c.authored_date, 6)) AS offsets",
+        {"repo_id": repo_id},
+    ) + engine.run_cypher(
+        # A capped history's blame also reaches commits the graph doesn't hold.
+        "MATCH (n {repo_id: $repo_id}) WHERE (n:Function OR n:Class) AND n.file ENDS WITH '.py' "
+        "AND n.last_modified_at IS NOT NULL "
+        "RETURN n.file AS file, collect(DISTINCT right(n.last_modified_at, 6)) AS offsets",
+        {"repo_id": repo_id},
+    ):
+        offsets.setdefault(row["file"], set()).update(row["offsets"])
+    for file_path in sorted(f for f, seen in offsets.items() if len(seen) > 1):
+        blame_failures[file_path] = _apply_function_recency(engine, repo, repo_id, file_path, overwrite=True)
+        pace()
+    for label in _DATED_LABELS:
+        while True:
+            rows = engine.run_cypher(
+                f"MATCH (n:{label} {{repo_id: $repo_id}}) "
+                "WHERE any(d IN [n.authored_date, n.created_at, n.last_modified_at] "
+                "          WHERE d IS NOT NULL AND NOT d ENDS WITH '+00:00') "
+                "RETURN elementId(n) AS id, n.authored_date AS a, n.created_at AS c, n.last_modified_at AS l "
+                "LIMIT $limit",
+                {"repo_id": repo_id, "limit": CHUNK_ROWS},
+            )
+            if not rows:
+                break
+            engine.run_cypher(
+                "UNWIND $rows AS row MATCH (n) WHERE elementId(n) = row.id "
+                "SET n.authored_date = row.a, n.created_at = row.c, n.last_modified_at = row.l",
+                {"rows": [{"id": r["id"], "a": _utc(r["a"]), "c": _utc(r["c"]), "l": _utc(r["l"])} for r in rows]},
+            )
+            pace()
+    _reconcile_module_recency(engine, repo_id, pace)
+
+
 def sync_git_history(
     engine, registry, repo_id: str, max_count: int | None = None, force: bool = False,
     on_initial: Callable[[int], None] | None = None, between_chunks: Callable[[], bool] | None = None,
@@ -502,6 +608,9 @@ def sync_git_history(
             for repairing a graph whose MODIFIES edges were destroyed by a
             bug (e.g. the old replace_file_nodes blanket-delete) — the
             normal fast/noop path would otherwise never re-create them.
+            A graph holding commits of an older `HISTORY_FORMAT` is
+            migrated in place first, without reading git history again
+            (`_migrate_to_utc`; mode `"upgraded"` when nothing else changed).
         on_initial: Called with the number of commits a *first* sync is about
             to read, before it reads them (the agent logs it: a first sync of
             a long history takes a while).
@@ -513,7 +622,7 @@ def sync_git_history(
             MERGE or an idempotent recency write).
 
     Returns:
-        A dict with `mode` (`"noop"`, `"initial"`, `"fast"`, `"reconcile"`,
+        A dict with `mode` (`"noop"`, `"upgraded"`, `"initial"`, `"fast"`, `"reconcile"`,
         or `"stopped"` when `between_chunks` stopped it), `commits_indexed`,
         and `commits_deleted`.
 
@@ -546,9 +655,19 @@ def sync_git_history(
         # A shallow clone deepened (or unshallowed) since: commits read as
         # boundaries then, with every file as touched, have parents now.
         reshaped = last is not None and shallow != repo_record.last_indexed_shallow
+        blame_failures: dict[str, Exception | None] = {}
+        pace = _Pacer(between_chunks)
+        upgraded = _history_outdated(engine, repo_id)
+        if upgraded:
+            try:
+                _migrate_to_utc(engine, repo, repo_id, pace, blame_failures)
+            except _Stopped:
+                return {"mode": "stopped", "commits_indexed": 0, "commits_deleted": 0}
+            _stamp_history_format(engine, repo_id)
 
         if last == head_sha and not force and not reshaped:
-            return {"mode": "noop", "commits_indexed": 0, "commits_deleted": 0}
+            _log_blame_failures(repo_id, blame_failures)
+            return {"mode": "upgraded" if upgraded else "noop", "commits_indexed": 0, "commits_deleted": 0}
 
         if last is None:
             mode = "initial"
@@ -562,22 +681,14 @@ def sync_git_history(
             on_initial(count if max_count is None else min(count, max_count))
 
         extractor = GitHistoryExtractor(repo_id, repo_record.path)
-        blame_failures: dict[str, Exception | None] = {}
-        pace = _Pacer(between_chunks)
         try:
             commits_indexed, commits_deleted = _sync(engine, repo, repo_id, extractor, mode, last, max_count,
                                                      blame_failures, pace)
         except _Stopped:
             return {"mode": "stopped", "commits_indexed": 0, "commits_deleted": 0}
 
-        failed = sorted(path for path, exc in blame_failures.items() if exc is not None)
-        if failed:
-            # One line per sync: a blobless partial clone fails the blame of every file.
-            logger.warning(
-                f"{repo_id}: git blame failed for {len(failed)} file(s), recency skipped for them "
-                f"(first {failed[0]!r}: {blame_failures[failed[0]]})"
-            )
-
+        _log_blame_failures(repo_id, blame_failures)
+        _stamp_history_format(engine, repo_id)
         registry.set_last_indexed_commit(repo_id, head_sha, shallow)
         return {"mode": mode, "commits_indexed": commits_indexed, "commits_deleted": commits_deleted}
     finally:

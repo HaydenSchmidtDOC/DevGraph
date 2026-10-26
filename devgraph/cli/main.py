@@ -648,7 +648,8 @@ def annotate(
     """Configure or use Phase 2 doc annotations for a repository.
 
     With --docs-path: register/update the repo's docs folder (registry-scoped
-    only — never a path outside the repo).
+    only — never a path outside the repo); a full scan applies it (the agent
+    runs one for a watched repository, or run 'devgraph rescan').
     With --note: parse and upsert one Markdown note (Requirement /
     DesignDecision / ArchitectureNote front-matter) into the graph immediately.
     """
@@ -663,11 +664,27 @@ def annotate(
             if docs_path is not None:
                 registry.set_docs_path(repo_id, docs_path)
                 console.print(f"[green][OK][/green] Docs path set for {escape(repo_id)}: {escape(docs_path)}")
+                _print_rescan_hint(repo_id)
 
             if note is not None:
                 note_path = repo.path / note
                 if not is_within(note_path.resolve(), repo.path):
                     console.print("[red][X] Error:[/red] note path must be inside the repository")
+                    raise typer.Exit(code=1)
+                # A scan indexes notes under the docs path only, and removes any
+                # other: one indexed here would be gone at the next catch-up.
+                current_docs = docs_path if docs_path is not None else repo.docs_path
+                if not current_docs:
+                    console.print(
+                        "[red][X] Error:[/red] no docs path is set; set it first with "
+                        f"'devgraph annotate {escape(repo_id)} --docs-path <folder>' (notes are indexed only under it)"
+                    )
+                    raise typer.Exit(code=1)
+                if not is_within(note_path.resolve(), (repo.path / current_docs).resolve()):
+                    console.print(
+                        f"[red][X] Error:[/red] the note is outside the docs path ({escape(current_docs)}); "
+                        "move it there, or change the docs path with --docs-path (notes are indexed only under it)"
+                    )
                     raise typer.Exit(code=1)
 
                 settings = get_settings()
@@ -773,13 +790,24 @@ def mentions(repo_id: str, action: str) -> None:
     """Enable or disable mentions indexing for a repository.
 
     Off by default (Design Brief Principle 2). When enabled, Markdown files
-    are scanned for references to entities in the graph.
+    are scanned for references to entities in the graph. A full scan applies
+    the change (the agent runs one for a watched repository, or run
+    'devgraph rescan').
 
     Args:
         repo_id: The repository ID.
         action: 'enable' or 'disable'.
     """
     _set_external_source_flag(repo_id, action, "mentions_enabled", "Mentions")
+
+
+def _print_rescan_hint(repo_id: str) -> None:
+    """Say when a changed docs path or mentions setting takes effect: only a
+    full scan indexes or removes the notes and Documents it decides."""
+    console.print(
+        f"Takes effect at the next full scan: the agent runs one within about a minute while it watches "
+        f"{escape(repo_id)}, or run 'devgraph rescan {escape(repo_id)}' now."
+    )
 
 
 def _set_external_source_flag(repo_id: str, action: str, setter_flag: str, label: str) -> None:
@@ -805,6 +833,8 @@ def _set_external_source_flag(repo_id: str, action: str, setter_flag: str, label
 
             verb = "enabled" if enabled else "disabled"
             console.print(f"[green][OK][/green] {label} {verb} for {escape(repo_id)}")
+            if setter_flag == "mentions_enabled":
+                _print_rescan_hint(repo_id)
         finally:
             registry.close()
     except typer.Exit:

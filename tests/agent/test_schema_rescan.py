@@ -50,6 +50,7 @@ def setup(monkeypatch, tmp_path, *, valid=True):
     monkeypatch.setattr(schema_rescan, "index_outdated", lambda e, r: r in state["outdated"])
     stub(monkeypatch, schema_rescan, "full_scan_elsewhere", lambda e, r: state.get("elsewhere"))
     monkeypatch.setattr(schema_rescan, "schema_pending", lambda e, r, p: state["pending"])
+    monkeypatch.setattr(schema_rescan, "scan_options_pending", lambda e, r, d, m: False)
     monkeypatch.setattr(schema_rescan, "schema_file_hash", lambda p: state["hash"])
 
     def resolve(path):

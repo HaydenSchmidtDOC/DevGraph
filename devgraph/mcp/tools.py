@@ -94,6 +94,39 @@ def _source_off_notice(max_results: int, what: str, command: str, repo_id: str) 
     }
 
 
+def _rescan_pending_notice(engine: GraphEngine, registry: RepoRegistry | None, repo_id: str) -> str | None:
+    """A notice when `repo_id`'s docs path or mentions setting differs from the
+    ones its last full scan used (as indexer.dispatch `scan_options_pending`):
+    its docs notes and mentions are not indexed (or removed) yet."""
+    repo = registry.get(repo_id) if registry is not None else None
+    if repo is None:
+        return None
+    used = _query(
+        engine,
+        "MATCH (r:Repository {repo_id: $repo_id}) WHERE r.scan_mentions IS NOT NULL "
+        "RETURN r.scan_docs_path AS docs_path, r.scan_mentions AS mentions",
+        {"repo_id": repo_id},
+    )
+    if not used or (used[0]["docs_path"], used[0]["mentions"]) == (repo.docs_path or "", bool(repo.mentions_enabled)):
+        return None
+    # The agent's rescan scheduler looks at active, watched repositories only.
+    when = (
+        f"the agent rescans it within about a minute, or run `devgraph rescan {repo_id}`"
+        if repo.active and repo.watch_enabled else f"run `devgraph rescan {repo_id}` to apply it"
+    )
+    return (
+        f"the docs path or mentions setting of {repo_id} changed since its last full scan, so its docs notes "
+        f"and mentions are not up to date yet; {when}"
+    )
+
+
+def _with_notice(result: dict[str, Any], notice: str | None) -> dict[str, Any]:
+    """`result` with `notice` added, after any notice it already has (a truncation)."""
+    if not notice:
+        return result
+    return {**result, "notice": f"{result['notice']}; {notice}" if result.get("notice") else notice}
+
+
 #: How long a built-in tool's query may run before it is cancelled.
 BUILTIN_TIMEOUT_S = 30
 
@@ -2717,6 +2750,7 @@ def find_requirements_for(
     cross_repo: bool = False,
     max_results: int = 15,
     extra_labels: tuple[str, ...] = (),
+    registry: RepoRegistry | None = None,
 ) -> dict[str, Any]:
     """Find requirements a component (Module/Service/etc.) satisfies.
 
@@ -2727,6 +2761,7 @@ def find_requirements_for(
         cross_repo: If True, search across repos
         max_results: Maximum number of results to return in the envelope
         extra_labels: The repository's declared labels, looked up besides the built-in ones
+        registry: RepoRegistry; a `notice` says when a changed docs path awaits its rescan
 
     Returns:
         Dict with count, results, and truncated flag containing the Requirement
@@ -2751,7 +2786,7 @@ def find_requirements_for(
         params["repo_id"] = repo_id
 
     results, more = _list_query(engine, cypher, params)
-    return _capped_envelope(results, more, max_results)
+    return _with_notice(_capped_envelope(results, more, max_results), _rescan_pending_notice(engine, registry, repo_id))
 
 
 def trace_design_rationale(
@@ -2760,6 +2795,7 @@ def trace_design_rationale(
     component_name: str,
     cross_repo: bool = False,
     extra_labels: tuple[str, ...] = (),
+    registry: RepoRegistry | None = None,
 ) -> dict[str, Any]:
     """Trace the design rationale (decisions, notes, requirements) behind a component.
 
@@ -2769,6 +2805,7 @@ def trace_design_rationale(
         component_name: Name of the component (Module/Service/Class/etc.)
         cross_repo: If True, search across repos
         extra_labels: The repository's declared labels, looked up besides the built-in ones
+        registry: RepoRegistry; a `notice` says when a changed docs path awaits its rescan
 
     Returns:
         Dict grouping every Requirement/DesignDecision/ArchitectureNote linked
@@ -2794,7 +2831,7 @@ def trace_design_rationale(
         params["repo_id"] = repo_id
 
     results = _query(engine, cypher, params)
-    return _sanitize_row(results[0])
+    return _with_notice(_sanitize_row(results[0]), _rescan_pending_notice(engine, registry, repo_id))
 
 
 def blame_component(
@@ -3159,7 +3196,8 @@ def find_mentions(
     """Find Document nodes that mention an entity, or what a Document mentions.
 
     When the repository's mentions indexing is off (mentions_enabled=False) the
-    envelope is empty, with a `notice` saying how to enable it.
+    envelope is empty, with a `notice` saying how to enable it; just turned
+    on or off, a `notice` says its rescan is still to come.
 
     Args:
         engine: GraphEngine instance
@@ -3217,7 +3255,7 @@ def find_mentions(
         params["repo_id"] = repo_id
 
     results, more = _list_query(engine, cypher, params)
-    return _capped_envelope(results, more, max_results)
+    return _with_notice(_capped_envelope(results, more, max_results), _rescan_pending_notice(engine, registry, repo_id))
 
 
 def list_recent_changes(
