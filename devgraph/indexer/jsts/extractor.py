@@ -457,7 +457,7 @@ def _block_names(site: Node, body: Node) -> set[str]:
     found: set[bytes] = set()
     child, node = site, site.parent
     while node is not None and node != body:
-        if node.type in _FUNCTION_VALUE_TYPES:
+        if node.type in _FUNCTION_VALUE_TYPES or node.type == "method_definition":
             found |= _bound_names(node)
         elif node.type == "statement_block":
             for statement in node.named_children:
@@ -475,12 +475,25 @@ def _block_names(site: Node, body: Node) -> set[str]:
     return _decode(found)
 
 
+def _anonymous_function(node: Node) -> bool:
+    """Whether `node` is a function with no Function of its own, whose calls
+    are the enclosing scope's: a function value `_named_function` does not
+    name (a callback), or a method of an object literal `_object_path` does
+    not define (`configure({ onDone() {} })`, a Vue options object)."""
+    if node.type in _FUNCTION_VALUE_TYPES:
+        return not _named_function(node)
+    return node.type == "method_definition" and node.parent is not None and (
+        node.parent.type == "object" and _object_path(node.parent) is None
+    )
+
+
 def _in_function_expression(site: Node, body: Node) -> bool:
-    """Whether a `function` expression (not an arrow) between `site` and its
-    function's `body` holds it."""
+    """Whether a `function` expression or an object's method (not an arrow)
+    between `site` and its function's `body` holds it: it binds its own
+    `this`."""
     node = site.parent
     while node is not None and node != body:
-        if node.type in ("function_expression", "generator_function"):
+        if node.type in ("function_expression", "generator_function", "method_definition"):
             return True
         node = node.parent
     return False
@@ -494,8 +507,9 @@ def _call_functions(body: Node) -> list[Node]:
     than hoisted to the outer function (mirrors the Python extractor's
     `_call_functions`). An anonymous function (a callback, `items.map(i =>
     <Row />)`, `useEffect(() => ...)`, an `onClick` arrow, an inline render
-    prop; not one `_named_function` makes a Function of its own) is walked
-    too: its calls and JSX elements are the enclosing function's, as a
+    prop, an unnamed object's method; not one `_named_function` or
+    `_object_path` makes a Function of its own, `_anonymous_function`) is
+    walked too: its calls and JSX elements are the enclosing function's, as a
     Python lambda's are, and a callback's parameters and locals shadow there
     (`_block_names`); a JSX tag naming a callback's parameter is skipped
     here. `require(...)` is module-system syntax, captured by
@@ -504,7 +518,7 @@ def _call_functions(body: Node) -> list[Node]:
 
     def walk(node: Node, shadowed: frozenset[bytes] | None) -> None:
         if node.type in _NESTED_SCOPE_TYPES:
-            if node.type not in _FUNCTION_VALUE_TYPES or _named_function(node):
+            if not _anonymous_function(node):
                 return
             shadowed = (shadowed or frozenset()) | _bound_names(node)
         if node.type == "call_expression":

@@ -437,6 +437,9 @@ ones included, shadow there like a block's locals (`_block_names`), so
 shadows inside it. A `function` expression (not an arrow) binds its own
 `this` (`_in_function_expression`), so `this.m()` there is not pinned to
 the class. A named nested function (`_named_function`) keeps its own calls.
+A method of an object literal `_object_path` does not define
+(`configure({ onDone() { ... } })`, `export default { methods: {...} }`)
+is walked the same way (`_anonymous_function`), binding its own `this`.
 The call-graph fixtures list no call inside a callback, so their measures
 are unchanged.
 

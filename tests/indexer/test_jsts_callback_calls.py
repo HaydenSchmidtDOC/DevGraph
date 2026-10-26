@@ -112,3 +112,26 @@ def test_this_in_a_function_expression_callback_is_not_the_class():
 
     assert ("src/cart.ts", "resolved") in pins(arrow)
     assert ("src/cart.ts", "resolved") not in pins(plain)
+
+
+def test_a_method_of_an_unnamed_object_is_the_enclosing_functions():
+    """`configure({ onDone() { ... } })` and a Vue options object's methods
+    have no Function of their own: their calls are the function's (or the
+    Module's) holding the object; a defined object's methods stay their own."""
+    source = """
+        export function outer() {
+          configure({ onDone(result) { t5(); result(); }, get size() { return t6(); } });
+        }
+        export default { methods: { save() { t7(); } } };
+        const service = { run() { t8(); } };
+        function t5() {}
+        function t6() {}
+        function t7() {}
+        function t8() {}
+        function result() {}
+    """
+    got = callees(source, "outer", "src/app.ts")
+    assert {"t5", "t6"} <= got and "result" not in got
+    assert "t7" in callees(source, "src/app.ts", "src/app.ts")
+    assert "t8" in callees(source, "run", "src/app.ts")
+    assert "t8" not in callees(source, "src/app.ts", "src/app.ts")

@@ -215,7 +215,8 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: service's build context resolved from the compose file's folder, the
 #: repository root (`build: .` at the root, `context: ..` one level down)
 #: owning every file no deeper context claims; and JS/TS calls inside an
-#: anonymous callback (`useEffect(() => ...)`, an `onClick` arrow, `.then`)
+#: anonymous callback (`useEffect(() => ...)`, an `onClick` arrow, `.then`,
+#: an unnamed object literal's method)
 #: attributed to the named function holding it (jsts `_call_functions`);
 #: and Python datastores read from the syntax tree (an import of a client
 #: module or one below it, a known client call, a URL passed to a call; no
