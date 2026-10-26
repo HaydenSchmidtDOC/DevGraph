@@ -287,9 +287,17 @@ only function of that name in the route's own file. A folded stub is left out
 of `search_component`, `get_source` and `describe_node`, neighbour lists show
 the function in its place, `describe_node` on the function includes the
 stub's relationships, and `trace_request_flow` lists the function (and
-follows its calls) with the stub's edges moved to it. A stub that stands for
-no single function (its handler wasn't found, or several functions qualify)
-stays visible: `describe_node` and `get_source` mark it
+follows its calls) with the stub's edges moved to it. Routes whose handlers
+share a name (three controllers' `list`) share one stub; when each of those
+routes resolved to its own function, the stub is left out the same way,
+`describe_node` on a route lists only its own function, and
+`trace_request_flow` lists the traced route's own (each component carries
+its `file` and `owner`, so same-named ones are told apart). A Spring route
+mapped on an interface resolves to the interface's method and each
+implementing controller's: one method and its overrides, so its stub is left
+out the same way and `trace_request_flow` lists each of them. A stub that
+some route resolved to no single function (its handler wasn't found, or
+several unrelated functions qualify) stays visible: `describe_node` and `get_source` mark it
 `unresolved_handler: true` (file null), never folding it into an unrelated
 function of the same name.
 
@@ -305,14 +313,27 @@ and `describe_node` do, or a method named with its class (`A.run`,
 an error. `get_source` on an unknown name (or one not in `file`, or of no
 such `owner`) is an error with similar names, never an all-null answer.
 
+**Endpoints a change reaches**: an API route reaches its handler by
+`IMPLEMENTS`, not `CALLS`, so it is never a dependent or a caller. Instead
+`impact_analysis` and `impact_analysis_for_diff` add `endpoints`, the routes
+whose handler is the changed component or any of its dependents (to four
+hops), and `find_callers` adds `routed_by`, the routes the target handles.
+Each is a `{count, results, truncated}` envelope of rows shaped as
+`list_endpoints` gives them (`name`, `method`, `path`, `mounted`,
+`framework`, `files`, `handlers`, `services`, `repo_id`); `name` is what
+`trace_request_flow` takes. `risk_level` still counts direct dependents only.
+Where dependents or callers carry `target_files` (several same-named
+targets), so does each endpoint.
+
 **Response shape (`count`/`results`/`truncated`)**: `search_component`,
 `find_callers`, `list_services`, `list_endpoints`, `find_related_prs`, `issue_history_for`,
 `find_requirements_for` and `blame_component` return
 `{"count": N, "results": [...], "truncated": bool}` instead of a bare
 list — read the match set from `result["results"]`, and check `truncated`
 before assuming you've seen everything. `find_related_files`,
-`explain_architecture` and `impact_analysis` apply the same envelope to each
-of their list-valued fields individually (e.g. `impact["direct_dependents"]["results"]`). Pass
+`explain_architecture`, `impact_analysis` and `impact_analysis_for_diff` apply the same envelope to each
+of their list-valued fields individually (e.g. `impact["direct_dependents"]["results"]`,
+`impact["endpoints"]["results"]`), as `find_callers` does to `routed_by`. Pass
 `max_results` (default 15) to widen the sample when you genuinely need more
 than the default. `search_component` ranks the whole query as the exact name
 first (then the same name in other case), then names starting with or
@@ -377,10 +398,10 @@ Prefer these over re-reading files when the question is structural:
 | "What calls X, but only recently modified?" | `find_callers` with `modified_within_commits=N` (filters results to entities touched in the last N commits) |
 | "What calls X, but only from within class Y?" | `find_callers` with `scope_to_class=Y` (cuts noise from unrelated same-named methods elsewhere in the repo) |
 | "What definitely calls X?" | `find_callers` with `resolved_only=True` (Python callers resolved through scope or imports) |
-| "What breaks if I change X?" | `impact_analysis` (name, not path; test-code dependents come last in each list, with `test_count`, and `include_tests=False` leaves them out) |
+| "What breaks if I change X?" | `impact_analysis` (name, not path; test-code dependents come last in each list, with `test_count`, and `include_tests=False` leaves them out; `endpoints` lists the API routes it reaches) |
 | "What breaks across this whole PR/diff?" | `impact_analysis_for_diff` (base_ref/head_ref, both must exist locally — never fetches) |
 | "What does X depend on?" | `get_service_dependencies` (service name), `find_related_files` (function/class name, not path; entries in test code come last in each list, with `test_count`, and `include_tests=False` leaves them out) |
-| "Trace a request from this endpoint through services/datastores" | `trace_request_flow` (endpoint name like `GET /users/<id>`, or a bare path like `/users/<id>` for every method) |
+| "Trace a request from this endpoint through services/datastores" | `trace_request_flow` (endpoint name like `GET /users/<id>`, or a bare path like `/users/<id>` for every method; a Django route with or without its path's leading `/`) |
 | "What changed recently?" | `list_recent_changes` (lists entities touched in the last N commits, most-recent first; filters by optional entity type) |
 | "What's the overall architecture?" | `explain_architecture` (each service's datastores: databases, vector stores, queues and caches), `summarise_repository` (node counts, `cache_count` included) |
 | "Which routes does this service expose?" | `list_endpoints` (filters: `method`, `path_prefix` by whole segments, `framework`, `service`; each route with its handlers and owning service; a route whose mount its file doesn't show has `mounted: false` and a name like `GET ?/:id (routes/users.js)`) |
@@ -399,7 +420,7 @@ and classes added, removed and changed in each file, with line numbers. Its
 `impacted_callers` come from the last index of the working tree, not from
 either ref, so read them as a hint. `impact_analysis_for_diff` compares the same
 way and traces dependents, direct and transitive, of the functions and classes
-changed or removed; added ones are listed in `added_symbols`, since nothing
+changed or removed, with the API `endpoints` they reach; added ones are listed in `added_symbols`, since nothing
 depends on them yet. A changed code file whose symbols weren't diffed (past the
 200-file cap, unreadable, or renamed) counts every indexed symbol in it, and a
 notice says so; so does a changed symbol the index doesn't have, whose

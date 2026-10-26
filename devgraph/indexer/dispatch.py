@@ -227,9 +227,25 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: language; and a Django class-based view's route (`View.as_view()`, DRF's
 #: `APIView.as_view()` and a ViewSet's `as_view({...})`) IMPLEMENTS its
 #: Class and the request-handling methods of it (apis/extractor.py
-#: `_django_implements`), not a Function of the class's name.
+#: `_django_implements`), not a Function of the class's name; 21: gin and
+#: echo group routes with an empty or relative path (`users.GET("", h)`),
+#: and chi's and fiber's `Mount` of a router a same-file function returns
+#: or a variable holds, its routes under the mount's prefix; C# top-level
+#: statements' local functions as top-level Functions, and a minimal-API
+#: handler resolved as a call to it (another file's class's method), and
+#: ASP.NET `MapMethods` routes; Spring mappings declared on an interface,
+#: implemented by the methods of the controllers implementing it (their
+#: `mkeys`, apis/routes.py `spring_interface_pins`), and a Spring mapping's
+#: property placeholder read as its default (`spring_path`); an unprefixed
+#: Python router's `""` and `"/"` routes apart (`GET ? (file)` and
+#: `GET ?/ (file)` until a mount names them), and an Express route with an
+#: empty path (`router.get('', h)`, its router's mount); Flask
+#: `add_url_rule` (a `MethodView.as_view` view IMPLEMENTS its Class and its
+#: HTTP method handlers) and FastAPI `add_api_route` routes
+#: (apis/extractor.py `_rule_views`); NestJS controllers' routes (jsts
+#: `_nest_routes`) and Fastify's `route({ method, url, handler })`.
 #: An index stamped lower, or not at all, is rescanned automatically.
-INDEX_FORMAT = 20
+INDEX_FORMAT = 21
 
 
 def index_outdated(engine: GraphEngine, repo_id: str) -> bool:

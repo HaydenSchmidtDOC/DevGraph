@@ -65,7 +65,14 @@ from pathlib import Path
 import tree_sitter_kotlin as tskotlin
 from tree_sitter import Language, Node, Parser, Range
 
-from devgraph.indexer.apis.routes import add_route, spring_routes
+from devgraph.indexer.apis.routes import (
+    SPRING_CONTROLLERS,
+    add_route,
+    spring_implementer_key,
+    spring_interface_pins,
+    spring_routes,
+    spring_type_names,
+)
 from devgraph.indexer.calls import (
     STOP_METHODS,
     STOP_TYPES,
@@ -495,6 +502,11 @@ class _KotlinResolver:
         self.types: dict[str, tuple[list[str], str]] = {}
         self.imported_functions: dict[str, list[str]] = {}
         self.wildcards: list[list[str]] = []
+        # A nested class imported by name (`import a.b.Outer.Api`) -> its
+        # qualified name, and the classes a class's wildcard imports
+        # (`import a.b.Outer.*`): the types a supertype can name.
+        self.nested_types: dict[str, str] = {}
+        self.class_wildcards: list[list[str]] = []
         self.symbol_imports: list[tuple[str, str, list[str]]] = []  # (label, name, pins)
         self.module_pins: set[str] = set()
         for dotted, is_wildcard, alias in _extract_imports(root, source):
@@ -515,6 +527,10 @@ class _KotlinResolver:
                 # Members of an object or companion (`a.b.Obj.f`, `a.b.Obj.*`).
                 if not is_wildcard:
                     self.imported_functions[alias or segments[-1]] = self.class_pins(package, cls)
+                    if segments[-1][:1].isupper():
+                        self.nested_types[alias or segments[-1]] = dotted
+                else:
+                    self.class_wildcards.append(segments)
                 continue
             self.types[alias or cls] = (package, cls)
 
@@ -821,17 +837,47 @@ def _annotations(node: Node, source: bytes) -> dict[str, dict[str, list[str] | N
             elif key in ("value", "path"):
                 literal = all(
                     item.type == "string_literal" and not _text(item, source).startswith('"""')
-                    and all(part.type == "string_content" for part in item.named_children)
+                    and all(part.type == "string_content" or (
+                        part.type == "escape_sequence" and _text(part, source) == "\\$"
+                    ) for part in item.named_children)
                     for item in items
                 )
-                args["value"] = [_text(item, source)[1:-1] for item in items] if literal else None
+                # `"\${api.base:/v2}"`: an escaped `$` is a Spring placeholder's.
+                args["value"] = [_text(item, source)[1:-1].replace("\\$", "$") for item in items] if literal else None
         found[_text(name, source).rsplit(".", 1)[-1]] = args
     return found
 
 
-def _spring_routes(top_level: list[Node], source: bytes, result: ExtractionResult, file_path: str, repo_id: str) -> None:
+def _written_supertypes(node: Node, source: bytes) -> list[str]:
+    """A class's supertypes as written (`_extract_supertype_names`), type
+    arguments left off: `com.x.Api`, `CrudApi<A, B>` -> CrudApi."""
+    specifiers = _child_of_type(node, "delegation_specifiers")
+    written = []
+    for child in specifiers.named_children if specifiers is not None else []:
+        user_type = _child_of_type(child, "user_type") if child.type == "delegation_specifier" else None
+        invocation = _child_of_type(child, "constructor_invocation") if child.type == "delegation_specifier" else None
+        if user_type is None and invocation is not None:
+            user_type = _child_of_type(invocation, "user_type")
+        if user_type is not None:
+            written.append("".join(_text(user_type, source).split("<", 1)[0].split()))
+    return written
+
+
+def _spring_routes(
+    top_level: list[Node], source: bytes, result: ExtractionResult, file_path: str, repo_id: str,
+    resolver: _KotlinResolver,
+) -> None:
     """A Spring controller's mapped functions as Endpoints (apis/routes.py),
-    each implemented by its function, owned by its class."""
+    each implemented by its function, owned by its class; an interface's
+    mapped functions too, implemented by its function and each implementing
+    controller's (`spring_interface_pins`), whose functions carry a match
+    key (`spring_implementer_key`) for each qualified name each of its
+    class's supertypes can have (`spring_type_names`), unless the class has
+    a `@RequestMapping` of its own (Java's `_spring_routes`)."""
+    keys: dict[tuple[str, str], set[str]] = {}
+    package = resolver.layout.package
+    imported = {name: ".".join([*owner[0], owner[1]]) for name, owner in resolver.types.items()}
+    imported.update(resolver.nested_types)
 
     def walk(nodes: list[Node], classes: list[str]) -> None:
         for node in nodes:
@@ -841,15 +887,31 @@ def _spring_routes(top_level: list[Node], source: bytes, result: ExtractionResul
                 continue
             inner = [_text(name, source), *classes]
             mapped = _annotations(node, source)
+            interface = _child_of_type(node, "interface") is not None
+            supertypes = [
+                each for written in _written_supertypes(node, source)
+                for each in spring_type_names(written, package, imported,
+                                              [*resolver.wildcards, *resolver.class_wildcards])
+            ] if SPRING_CONTROLLERS & set(mapped) and "RequestMapping" not in mapped else []
             for member in body.named_children:
                 function = member.child_by_field_name("name")
                 if member.type == "function_declaration" and function is not None:
-                    for http_method, path in spring_routes(mapped, _annotations(member, source)):
+                    pins = spring_interface_pins(
+                        file_path, _owner_of(inner), ".".join([*package, _owner_of(inner)])
+                    ) if interface else None
+                    for http_method, path, mounted in spring_routes(mapped, _annotations(member, source), interface):
                         add_route(result, repo_id, file_path, "Spring", http_method, path, _text(function, source),
-                                  _owner_of(inner))
+                                  _owner_of(inner), pins, mounted)
+                    if supertypes:
+                        keys.setdefault((_text(function, source), _owner_of(inner)), set()).update(
+                            spring_implementer_key(each) for each in supertypes
+                        )
             walk(body.named_children, inner)
 
     walk(top_level, [])
+    for node in result.nodes:
+        if node.label == "Function" and (found := keys.get((node.name, node.properties.get("owner")))):
+            node.properties["mkeys"] = sorted(found)
 
 
 def extract_kotlin_file(source_code: str, file_path: str, repo_id: str) -> ExtractionResult:
@@ -1067,7 +1129,7 @@ def extract_kotlin_file(source_code: str, file_path: str, repo_id: str) -> Extra
 
     visit_block(root, None, "Module", [], top_level)
     result.relationships += sites.rows(file_path, repo_id)
-    _spring_routes(top_level, source_bytes, result, file_path, repo_id)
+    _spring_routes(top_level, source_bytes, result, file_path, repo_id, resolver)
 
     return own_edges(result, file_path)
 

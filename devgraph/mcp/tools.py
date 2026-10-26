@@ -112,13 +112,61 @@ IMPACT_MAX_SPLIT = 5
 IMPACT_MAX_DEPTH = 4
 
 
+#: Cypher binding an Endpoint `e`'s `handlers` (the Functions, and a Django
+#: class-based view's Class, it IMPLEMENTS) and `services` (the compose
+#: services it CALLS); `_ENDPOINT_FIELDS` then names what `_endpoint_row` reads.
+_ENDPOINT_DETAILS = """CALL (e) {
+    OPTIONAL MATCH (e)-[:IMPLEMENTS]->(f) WHERE f:Function OR f:Class
+    RETURN [h IN collect(DISTINCT {label: labels(f)[0], name: f.name, file: f.file, owner: f.owner})
+            WHERE h.name IS NOT NULL]
+           AS handlers
+}
+CALL (e) {
+    OPTIONAL MATCH (e)-[:CALLS]->(s:Service)
+    RETURN [n IN collect(DISTINCT s.name) WHERE n IS NOT NULL] AS services
+}
+"""
+_ENDPOINT_FIELDS = (
+    "{name: e.name, framework: e.framework, files: coalesce(e.sources, [e.source]), "
+    "handlers: handlers, services: services, repo_id: e.repo_id}"
+)
+
+
+def _capped_endpoints(pairs: str) -> str:
+    """Cypher binding `endpoint_count` and `endpoints` from `pairs`, a list of
+    {e, file} maps (an Endpoint and the file of a target it reaches): how many
+    distinct Endpoints there are, and the first `$max_results` of them by
+    repository and name, as `_ENDPOINT_FIELDS` maps them plus `target_files`
+    (their targets' files). Only those leave the database, however many
+    routes a shared helper is under."""
+    fields = _ENDPOINT_FIELDS[:-1] + ", target_files: target_files}"
+    return f"""CALL ({pairs}) {{
+  UNWIND {pairs} AS p
+  WITH p.e AS e, collect(p.file) AS target_files
+  ORDER BY e.repo_id, e.name
+  WITH collect({{e: e, target_files: target_files}}) AS ranked
+  RETURN size(ranked) AS endpoint_count, ranked[..$max_results] AS shown
+}}
+CALL (shown) {{
+  UNWIND shown AS s
+  WITH s.e AS e, s.target_files AS target_files
+  {_ENDPOINT_DETAILS}
+  RETURN collect({fields}) AS endpoints
+}}
+"""
+
+
 def _impact_expansion(cross_repo: bool, with_ids: bool = False) -> str:
     """Cypher continuing from `WITH collect(n) AS l0` (the changed nodes): one
     CALL per hop collecting the distinct nodes with a CALLS/USES/DEPENDS_ON edge
     into the previous hop's nodes, never one seen at an earlier hop, then
     returning `direct_dependents` (hop 1), `transitive_dependents` (hops 2 to
-    `IMPACT_MAX_DEPTH`), `direct_count` and `matched` (the changed nodes' {name, file, owner}).
-    `with_ids` adds each dependent's `id` (its elementId).
+    `IMPACT_MAX_DEPTH`), `direct_count`, `matched` (the changed nodes' {name, file, owner})
+    and `endpoint_nodes`: the Endpoints that IMPLEMENTS a changed node or a
+    dependent (an API route reaches its handler that way, one step past it),
+    which `_capped_endpoints` reads; they are not dependents, so
+    `direct_count` leaves them out. `with_ids` adds each dependent's `id` (its
+    elementId).
 
     Expanding distinct nodes hop by hop does work proportional to the nodes
     and edges within reach; a variable-length path enumerates every path, which
@@ -134,6 +182,13 @@ def _impact_expansion(cross_repo: bool, with_ids: bool = False) -> str:
             f"AND {' AND '.join(f'NOT d IN {s}' for s in seen)} "
             f"RETURN collect(DISTINCT d) AS l{hop} }}"
         )
+    levels = [f"l{k}" for k in range(IMPACT_MAX_DEPTH + 1)]
+    endpoint_scope = _cross_scope("e", "AND") if cross_repo else "AND e.repo_id = $repo_id"
+    parts.append(
+        f"CALL ({', '.join(levels)}) {{ UNWIND {' + '.join(levels)} AS m "
+        f"MATCH (e:Endpoint)-[:IMPLEMENTS]->(m) WHERE true {endpoint_scope} "
+        "RETURN collect(DISTINCT e) AS endpoint_nodes }"
+    )
     transitive = " + ".join(f"l{k}" for k in range(2, IMPACT_MAX_DEPTH + 1))
     ref = (
         "{name: d.name, type: labels(d)[0], file: coalesce(d.file, d.source_file), owner: "
@@ -142,7 +197,8 @@ def _impact_expansion(cross_repo: bool, with_ids: bool = False) -> str:
     parts.append(
         f"RETURN [d IN l1 | {ref}] AS direct_dependents, "
         f"[d IN {transitive} | {ref}] AS transitive_dependents, "
-        "size(l1) AS direct_count, [n IN l0 | {name: n.name, file: n.file, owner: coalesce(n.owner, '')}] AS matched"
+        "size(l1) AS direct_count, [n IN l0 | {name: n.name, file: n.file, owner: coalesce(n.owner, '')}] AS matched, "
+        "endpoint_nodes"
     )
     return "\n".join(parts)
 
@@ -420,14 +476,57 @@ def _fold_target(var: str, out: str = "folded") -> str:
     )
 
 
+def _route_base(endpoint: str, var: str, base: str) -> str:
+    """Cypher predicate: `base` is a real Function of the name of handler stub
+    `var` that Endpoint `endpoint` IMPLEMENTS, and each other real Function
+    or Class of that name it IMPLEMENTS is a method overriding it (its class
+    EXTENDS `base`'s, to four levels): a Spring route mapped on an interface
+    implements the interface's method and each implementing controller's
+    (apis/routes.py `spring_interface_pins`), one handler and its overrides.
+    Methods of unrelated classes are no such set."""
+    return (
+        f"{base}:Function AND {base}.repo_id = {var}.repo_id AND {base}.name = {var}.name AND {base}.file <> '' "
+        f"AND ({endpoint})-[:IMPLEMENTS]->({base}) "
+        f"AND NOT EXISTS {{ MATCH ({endpoint})-[:IMPLEMENTS]->(other) "
+        f"WHERE (other:Function OR other:Class) AND other.repo_id = {var}.repo_id AND other.name = {var}.name "
+        f"AND other.file <> '' AND other <> {base} "
+        f"AND NOT EXISTS {{ (other)<-[:CONTAINS]-(:Class)-[:EXTENDS*1..4]->(:Class)-[:CONTAINS]->({base}) }} }}"
+    )
+
+
+def _shadowed_stub(var: str) -> str:
+    """Cypher predicate: `var` is a route's handler stub (a file-less Function)
+    that every route implementing it resolved to exactly one real Function or
+    Class of its name (an IMPLEMENTS edge from the same Endpoint), or to one
+    method and its overrides (`_route_base`). Each route's handler is then
+    real, so the stub, which a name shared by
+    several routes' handlers (three controllers' `list`) makes one node for
+    them all, stands for nothing of its own: tools leave it out where they
+    would list it beside those handlers. A stub some route resolved to none,
+    or to several unrelated ones, stays visible (an unresolved handler)."""
+    twin = (
+        f"(twin:Function OR twin:Class) AND twin.repo_id = {var}.repo_id AND twin.name = {var}.name "
+        "AND twin.file <> ''"
+    )
+    return (
+        f"({var}:Function AND coalesce({var}.file, '') = '' AND EXISTS {{ ({var})<-[:IMPLEMENTS]-(:Endpoint) }} "
+        f"AND NOT EXISTS {{ MATCH ({var})<-[:IMPLEMENTS]-(e:Endpoint) "
+        f"WHERE COUNT {{ MATCH (e)-[:IMPLEMENTS]->(twin) WHERE {twin} }} <> 1 "
+        f"AND NOT EXISTS {{ MATCH (base:Function) WHERE {_route_base('e', var, 'base')} }} }})"
+    )
+
+
 def _search_branches(labels: tuple[str, ...], where: str, unwind: bool = False) -> str:
     """`CALL () { ... }` over one MATCH per label, so each can use its label's indexes.
 
     A route's handler stub is left out when it stands for a real Function
-    (`_fold_target`)."""
+    (`_fold_target`), or every route's handler is one (`_shadowed_stub`)."""
     branches = []
     for label in labels:
-        stub = f" {_fold_target('n')}  WITH n, folded WHERE folded IS NULL" if label == "Function" else ""
+        stub = (
+            f" {_fold_target('n')}  WITH n, folded WHERE folded IS NULL AND NOT {_shadowed_stub('n')}"
+            if label == "Function" else ""
+        )
         unwound = "UNWIND $names AS p " if unwind else ""
         branches.append(f"  {unwound}MATCH (n:`{label}`) WHERE {where}{stub} RETURN n")
     return "CALL () {\n" + "\n  UNION\n".join(branches) + "\n}\n"
@@ -568,7 +667,9 @@ _OWNED_LABELS = schema.FILE_SCOPED_LABELS
 _OWNER_OF = "CASE WHEN {v}.file IS NOT NULL THEN coalesce({v}.owner, '') END"
 
 # Each neighbour (`raw`) is listed as the Function it folds into when it is a
-# route's handler stub (`_fold_target`), so a handler is listed once.
+# route's handler stub (`_fold_target`), or left out when each of its routes'
+# handlers is a real Function (`_shadowed_stub`: it is a neighbour of an
+# Endpoint, which lists that Function too), so a handler is listed once.
 _DESCRIBE_GROUPS = f"""
 MATCH (n) WHERE elementId(n) IN $ids
 CALL (n) {{
@@ -580,7 +681,8 @@ CALL (n) {{
   WHERE $direction IN ['both','in'] AND {_DESCRIBE_NEIGHBOUR}
   RETURN 'in' AS dir, type(r) AS rel, raw
 }}
-{_fold_target("raw")}WITH dir, rel, coalesce(folded, raw) AS m
+{_fold_target("raw")}WITH dir, rel, raw, folded WHERE folded IS NOT NULL OR NOT {_shadowed_stub("raw")}
+WITH dir, rel, coalesce(folded, raw) AS m
 WITH dir, rel, count(DISTINCT m) AS total
 ORDER BY dir, rel
 LIMIT {_DESCRIBE_MAX_GROUPS + 1}
@@ -593,7 +695,8 @@ CALL (dir, rel) {{
   }}
   WITH raw WHERE raw.repo_id = $repo_id AND NOT raw:Repository
     AND ($labels IS NULL OR any(l IN labels(raw) WHERE l IN $labels))
-  {_fold_target("raw")}  WITH DISTINCT coalesce(folded, raw) AS m
+  {_fold_target("raw")}  WITH raw, folded WHERE folded IS NOT NULL OR NOT {_shadowed_stub("raw")}
+  WITH DISTINCT coalesce(folded, raw) AS m
   ORDER BY m.name, coalesce(m.file, m.path), m.owner
   LIMIT $cap
   RETURN collect({{
@@ -659,11 +762,11 @@ def _lookup_cypher(labels: tuple[str, ...], declared: frozenset[str]) -> str:
 
     Every label gets a name branch; only declared (provider) labels carry
     `path`, so only they get a path branch. A route's handler stub is left out
-    when it stands for a real Function (`_fold_target`). Labels are validated
-    identifiers.
+    when it stands for a real Function (`_fold_target`, `_shadowed_stub`).
+    Labels are validated identifiers.
     """
     tail = "AND NOT n:Repository AND ($file IS NULL OR $file IN [n.file, n.path, n.source_file])"
-    unfolded = f" {_fold_target('n')}  WITH n, folded WHERE folded IS NULL"
+    unfolded = f" {_fold_target('n')}  WITH n, folded WHERE folded IS NULL AND NOT {_shadowed_stub('n')}"
     body = "\n  UNION\n".join(
         f"  MATCH (n:`{label}`) WHERE n.repo_id = $repo_id AND n.{key} = $name {tail}"
         f"{unfolded if label == 'Function' else ''} RETURN n"
@@ -875,13 +978,20 @@ def _resolve_targets(
     in use that are no built-in one (`_undeclared_targets`), so a node whose label
     the repository does not declare (any more) is still found, and its label is
     added to the returned ones. `describe` False skips building the envelope.
-    `owner` keeps only the nodes of that owner (`_OWNER_MATCH`).
+    `owner` keeps only the nodes of that owner (`_OWNER_MATCH`). A route's
+    handler stub that folds into a real Function (`_fold_target`,
+    `_shadowed_stub`) is left out, as search and describe_node leave it out.
 
     Raises:
         ToolError: no node has that name (of `owner`), or none of them is in `file`.
     """
     params = {"name": name, "owner": owner, **({} if cross_repo else {"repo_id": repo_id})}
-    rows = _query(engine, _named_nodes(labels, "name", cross_repo) + f"WITH n WHERE {_OWNER_MATCH} " + _TARGETS_RETURN, params)
+    # A route's handler stub that stands for real Functions is no target of its own.
+    hidden = f"{_fold_target('n')}WITH n, folded WHERE folded IS NULL AND NOT {_shadowed_stub('n')} "
+    rows = _query(
+        engine, _named_nodes(labels, "name", cross_repo) + f"WITH n WHERE {_OWNER_MATCH} " + hidden + _TARGETS_RETURN,
+        params,
+    )
     if not rows and owner is not None:
         where = "any repository" if cross_repo else f"repository {_echo(repo_id)}"
         raise ToolError(
@@ -940,7 +1050,7 @@ def _node_ref(row: dict[str, Any]) -> dict[str, Any]:
 def _unresolved_marked(ref: dict[str, Any]) -> dict[str, Any]:
     """A candidate ref, with `unresolved_handler: true` when it is a route's
     handler stub left visible because it folds into no single real Function
-    (`_fold_target`): a file-less Function."""
+    (`_fold_target`, `_shadowed_stub`): a file-less Function."""
     return {**ref, "unresolved_handler": True} if ref["label"] == "Function" and ref.get("file") is None else ref
 
 
@@ -1021,7 +1131,9 @@ def describe_node(
         Function (`_fold_target`: the one Function its endpoint's handler
         reference resolved to, or else the one of its name in its route file) is not
         matched, is listed as that Function among neighbours, and has its
-        relationships folded into that Function's groups; any other stub
+        relationships folded into that Function's groups; a stub several
+        routes share, each of which resolved to its own Function
+        (`_shadowed_stub`), is neither matched nor listed; any other stub
         stays visible (an unresolved handler, file null).
     """
     file = _normalize_file(file)
@@ -1435,26 +1547,41 @@ def trace_request_flow(
             or a bare path (`"/users/<id>"`), which starts from that path's endpoint
             for every method. A route on a router whose mount its file doesn't show
             is its file's own endpoint, `"<METHOD> ?<path> (<file>)"`
-            (`"GET ?/:id (routes/users.js)"`), reached by that full name only
+            (`"GET ?/:id (routes/users.js)"`), reached by that full name only.
+            A Django route, stored without its path's leading "/", is reached
+            with it too (`"* /orders/"` or `"/orders/"` for `* orders/`)
         cross_repo: If True, cross repository boundaries
 
     Returns:
         Dict with `components` (the start endpoints and every node within five
-        hops, each {name, labels, repo_id}) and `edges` ({type, from, to} per
+        hops, each {name, labels, repo_id, file, owner}: an endpoint's file is
+        its route file, and file is null and owner left out for any other node
+        with no file) and `edges` ({type, from, to} per
         relationship, `from`/`to` naming its components). A route's handler
-        stub that folds into a real Function (`_fold_target`) is listed as that
-        Function, its edges with it, and the flow goes on from the Function's
-        calls (four more hops); a stub that folds into none stays listed as it is.
+        stub that folds into a real Function is listed as that Function, its
+        edges with it, and the flow goes on from the Function's calls (four
+        more hops): the one Function (or Class) of its name the traced endpoint
+        IMPLEMENTS too, when a name several routes' handlers share makes the
+        stub theirs together (or the method the others it IMPLEMENTS
+        override: a Spring interface's, `_route_base`), else
+        `_fold_target`'s; a stub that folds into none stays listed as it is.
 
     Raises:
         ToolError: no endpoint has that name or path.
     """
     repo_filter = _cross_scope("start", "AND") if cross_repo else "AND start.repo_id = $repo_id"
-    node = "{id: elementId(n), name: n.name, labels: labels(n), repo_id: n.repo_id}"
+    node = (
+        # An Endpoint has no file of its own: its route file (`source`). A
+        # handler stub's `source` is a route file too, not its own: it stays null.
+        "{id: elementId(n), name: n.name, labels: labels(n), repo_id: n.repo_id, "
+        "file: coalesce(n.file, CASE WHEN n:Endpoint THEN n.source END), owner: "
+        + _OWNER_OF.format(v="n") + "}"
+    )
     edge = "{id: elementId(r), type: type(r), start: elementId(startNode(r)), end: elementId(endNode(r))}"
     cypher = f"""
     MATCH (start:Endpoint)
-    WHERE (start.name = $endpoint OR ($bare AND start.name ENDS WITH ' ' + $endpoint))
+    WHERE (start.name IN [$endpoint, $django]
+           OR ($bare AND (start.name ENDS WITH ' ' + $endpoint OR start.name ENDS WITH ' ' + $django)))
     {repo_filter}
     WITH collect(start) AS starts
     CALL (starts) {{
@@ -1463,10 +1590,28 @@ def trace_request_flow(
         UNWIND rels AS r
         RETURN collect(DISTINCT node) AS reached, collect(DISTINCT r) AS edges
     }}
-    CALL (reached) {{
+    CALL (reached, starts) {{
         UNWIND reached AS raw
         {_fold_target("raw")}
-        WITH raw, folded WHERE folded IS NOT NULL
+        CALL (raw, starts) {{
+            UNWIND starts AS s
+            MATCH (s)-[:IMPLEMENTS]->(raw)
+            WHERE raw:Function AND coalesce(raw.file, '') = ''
+            MATCH (s)-[:IMPLEMENTS]->(twin)
+            WHERE (twin:Function OR twin:Class) AND twin.repo_id = raw.repo_id AND twin.name = raw.name
+              AND twin.file <> ''
+            RETURN collect(DISTINCT twin) AS own
+        }}
+        CALL (raw, starts) {{
+            UNWIND starts AS s
+            MATCH (s)-[:IMPLEMENTS]->(raw)
+            WHERE raw:Function AND coalesce(raw.file, '') = ''
+            MATCH (s)-[:IMPLEMENTS]->(base:Function)
+            WHERE {_route_base("s", "raw", "base")}
+            RETURN collect(DISTINCT base) AS bases
+        }}
+        WITH raw, CASE WHEN size(own) = 1 THEN own[0] WHEN size(bases) = 1 THEN bases[0] ELSE folded END AS folded
+        WHERE folded IS NOT NULL
         RETURN collect({{stub: elementId(raw), target: elementId(folded)}}) AS folds, collect(DISTINCT folded) AS targets
     }}
     CALL (targets) {{
@@ -1478,7 +1623,12 @@ def trace_request_flow(
     RETURN [n IN starts | {node}] AS starts, [n IN reached + targets + further | {node}] AS nodes,
         folds, [r IN edges + further_edges | {edge}] AS edges
     """
-    params = {"endpoint": start_endpoint, "bare": not any(ch.isspace() for ch in start_endpoint.strip())}
+    bare = not any(ch.isspace() for ch in start_endpoint.strip())
+    # A Django pattern is stored without its leading "/" (`* orders/`), which
+    # explain_architecture and list_endpoints show (`* /orders/`): either matches.
+    method, _, path = ("", "", start_endpoint.strip()) if bare else start_endpoint.strip().partition(" ")
+    django = f"{method} {path[1:]}".lstrip() if path.startswith("/") else None
+    params = {"endpoint": start_endpoint, "bare": bare, "django": django}
     if not cross_repo:
         params["repo_id"] = repo_id
 
@@ -1490,7 +1640,7 @@ def trace_request_flow(
     nodes: dict[str, dict[str, Any]] = {}
     for n in row["starts"] + row["nodes"]:
         if n["id"] not in fold:
-            nodes.setdefault(n["id"], {k: n[k] for k in ("name", "labels", "repo_id")})
+            nodes.setdefault(n["id"], _located({k: n[k] for k in ("name", "labels", "repo_id", "file", "owner")}))
     edges: dict[tuple[str, str, str], dict[str, Any]] = {}
     for e in row["edges"]:
         start, end = fold.get(e["start"], e["start"]), fold.get(e["end"], e["end"])
@@ -1605,7 +1755,11 @@ def find_callers(
         `target_files`, the files of the targets it calls (at most 10, with
         `target_file_count` past that; a file-less target is never listed), and
         the dict adds `ambiguous_targets`, a {count, results, truncated} envelope of their
-        {label, file} (file None for a file-less one; repo_id too when cross_repo)
+        {label, file} (file None for a file-less one; repo_id too when cross_repo).
+        `routed_by` is a {count, results, truncated} envelope of the Endpoints
+        that IMPLEMENTS the target (a route is no caller), each as
+        list_endpoints lists it, ordered by name, with `target_files` as a
+        caller row has them.
 
     Raises:
         ToolError: no node has that name, or none in `file`.
@@ -1660,12 +1814,28 @@ def find_callers(
 
     # Counted apart from the capped rows, so it is exact however many there are.
     tests = _query(engine, f"{callers} WITH DISTINCT caller WHERE {is_test} RETURN count(caller) AS tests", params)
+    # A route reaches its handler by IMPLEMENTS, not CALLS: listed apart.
+    routes = f"""
+    {_named_nodes(labels, "target_name", cross_repo, "target")}
+    MATCH (e:Endpoint)-[:IMPLEMENTS]->(target)
+    WHERE true
+    {recency_filter}
+    AND ($file IS NULL OR target.file = $file)
+    AND {_OWNER_MATCH.replace("n.", "target.")}
+    WITH collect({{e: e, file: target.file}}) AS pairs
+    {_capped_endpoints("pairs")}
+    RETURN endpoint_count, endpoints
+    """
+    routed_by = next(iter(_query(engine, routes, {**params, "max_results": max_results})), None)
     results, more = _list_query(engine, cypher, params)
     results = [_located(row) for row in results]
     if ambiguous:
         results = [_with_target_files(row, row["target_files"]) for row in results]
     envelope = _capped_envelope(results, more, max_results)
     envelope["test_count"] = tests[0]["tests"] if tests else 0
+    envelope["routed_by"] = _endpoints_envelope(
+        routed_by or {"endpoint_count": 0, "endpoints": []}, max_results, tagged=ambiguous is not None
+    )
     if ambiguous:
         envelope["ambiguous_targets"] = ambiguous
     return envelope
@@ -1986,7 +2156,12 @@ def impact_analysis(
         itself be listed as a dependent. Each list is ordered by name, file and
         owner, dependents in test code last, and its envelope adds
         `test_count`, its dependents in test code (listed or not); risk_level
-        counts them too.
+        counts them too. `endpoints` is a {count, results, truncated} envelope of
+        the Endpoints that IMPLEMENTS the component or any dependent (a route
+        reaches its handler that way, so it is never a dependent; risk_level
+        leaves them out), each as list_endpoints lists it, ordered by name;
+        when each file's targets are traced apart, each also has the
+        `target_files` of the targets it reaches.
 
     Raises:
         ToolError: no node has that name, or none in `file`.
@@ -2014,19 +2189,27 @@ def impact_analysis(
     CALL (l0) {{
     {_impact_expansion(cross_repo, with_ids=split)}
     }}
-    RETURN target_file, direct_dependents, transitive_dependents, direct_count
-    ORDER BY target_file
+    WITH collect({{target_file: target_file, direct_dependents: direct_dependents,
+                  transitive_dependents: transitive_dependents, direct_count: direct_count}}) AS rows,
+         collect([e IN endpoint_nodes | {{e: e, file: target_file}}]) AS nested
+    WITH rows, reduce(acc = [], each IN nested | acc + each) AS pairs
+    {_capped_endpoints("pairs")}
+    RETURN rows, endpoint_count, endpoints
     """
-    params = {"component_name": component_name, "file": file, "owner": owner, "split": split}
+    params = {
+        "component_name": component_name, "file": file, "owner": owner, "split": split, "max_results": max_results,
+    }
     if not cross_repo:
         params["repo_id"] = repo_id
 
-    results = _query(engine, cypher, params)
+    (answer_row,) = _query(engine, cypher, params)
+    results = sorted(answer_row["rows"], key=lambda r: r["target_file"] or "")
     if not split:
         row = results[0]
         answer = {
             "direct_dependents": dependents_envelope([_located(d) for d in row["direct_dependents"]]),
             "transitive_dependents": dependents_envelope([_located(d) for d in row["transitive_dependents"]]),
+            "endpoints": _endpoints_envelope(answer_row, max_results),
             "risk_level": _risk_level(row["direct_count"]),
         }
         if ambiguous:
@@ -2054,6 +2237,7 @@ def impact_analysis(
     }
     return {
         **{key: dependents_envelope(rows) for key, rows in lists.items()},
+        "endpoints": _endpoints_envelope(answer_row, max_results, tagged=True),
         "risk_level": _risk_level(max(row["direct_count"] for row in results)),
         "ambiguous_targets": ambiguous,
     }
@@ -2061,6 +2245,21 @@ def impact_analysis(
 
 def _risk_level(direct_count: int) -> str:
     return "high" if direct_count > 10 else "medium" if direct_count > 3 else "low"
+
+
+def _endpoints_envelope(row: dict[str, Any], max_results: int, tagged: bool = False) -> dict[str, Any]:
+    """A {count, results, truncated} envelope of the Endpoints `_capped_endpoints`
+    read into `row`, each as list_endpoints lists it, ordered by repository and
+    name; `tagged` adds each one's `target_files` (`_with_target_files`), as
+    the dependents or callers of several same-named targets carry them."""
+    shown = sorted(row["endpoints"], key=lambda e: (e["repo_id"], e["name"]))
+    rows = [_endpoint_row(e) for e in shown]
+    if tagged:
+        rows = [_with_target_files(r, e["target_files"]) for r, e in zip(rows, shown, strict=True)]
+    envelope = _envelope(rows, max_results)
+    envelope["count"] = row["endpoint_count"]
+    envelope["truncated"] = row["endpoint_count"] > len(envelope["results"])
+    return envelope
 
 
 _DIFF_TARGETS_CYPHER = """
@@ -2132,7 +2331,8 @@ def impact_analysis_for_diff(
         Dict with changed_files; added_symbols, changed_symbols and
         removed_symbols ({name, kind, container, file}); changed_components (the
         names traced); direct_dependents and transitive_dependents ({count,
-        results, truncated} envelopes); risk_level; truncated and
+        results, truncated} envelopes); endpoints (as impact_analysis gives
+        them); risk_level; truncated and
         truncated_reasons (compare_branches' caps); and notices. Dependents come
         from the last index of the working tree, not from either ref.
 
@@ -2207,10 +2407,19 @@ def impact_analysis_for_diff(
         )
     files = list(dict.fromkeys(f for paths in fallback.values() for f in paths))
 
-    row = {"direct_dependents": [], "transitive_dependents": [], "direct_count": 0, "matched": []}
+    row = {
+        "direct_dependents": [], "transitive_dependents": [], "direct_count": 0, "matched": [],
+        "endpoint_count": 0, "endpoints": [],
+    }
     if targets or files:
-        cypher = _DIFF_TARGETS_CYPHER + _impact_expansion(cross_repo)
-        rows = _query(engine, cypher, {"repo_id": repo_id, "targets": targets, "files": files})
+        cypher = (
+            f"CALL () {{\n{_DIFF_TARGETS_CYPHER}{_impact_expansion(cross_repo)}\n}}\n"
+            "WITH *, [e IN endpoint_nodes | {e: e, file: null}] AS pairs\n"
+            f"{_capped_endpoints('pairs')}"
+            "RETURN direct_dependents, transitive_dependents, direct_count, matched, endpoint_count, endpoints"
+        )
+        params = {"repo_id": repo_id, "targets": targets, "files": files, "max_results": max_results}
+        rows = _query(engine, cypher, params)
         if rows:
             row = rows[0]
     found = {(m["name"], m["file"], m["owner"]) for m in row["matched"]}
@@ -2231,6 +2440,7 @@ def impact_analysis_for_diff(
         "changed_components": sorted({m["name"] for m in row["matched"] if m["name"] is not None}),
         "direct_dependents": _envelope([_located(d) for d in row["direct_dependents"]], max_results),
         "transitive_dependents": _envelope([_located(d) for d in row["transitive_dependents"]], max_results),
+        "endpoints": _endpoints_envelope(row, max_results),
         "risk_level": _risk_level(row["direct_count"]),
         "truncated": bool(reasons),
         "truncated_reasons": list(reasons),
@@ -2254,7 +2464,9 @@ def explain_architecture(
         Dict with services_and_datastores ({service, uses}) and endpoints
         ({endpoints, calls}, only services some endpoint calls), each a
         {count, results, truncated} envelope; past `LIST_ROW_LIMIT` services
-        both are truncated, with a notice
+        both are truncated, with a notice. Each endpoint is named with a
+        leading "/" on its path, as list_endpoints gives its `path` (a Django
+        pattern's added: `* /orders/`); trace_request_flow takes that name
     """
     from devgraph.mcp.tool_plane import _sanitize_deep
 
@@ -2270,6 +2482,8 @@ def explain_architecture(
     LIMIT {LIST_ROW_LIMIT + 1}
     """
     rows, more = _list_query(engine, cypher, {"repo_id": repo_id})
+    for row in rows:
+        row["endpoint_names"] = [_slashed_endpoint_name(name) for name in row["endpoint_names"]]
     services: list[dict[str, Any]] = []
     endpoints: list[dict[str, Any]] = []
     seen_services: set[tuple[Any, ...]] = set()
@@ -2331,9 +2545,18 @@ def list_services(
 
 #: The `framework` an Endpoint carries, by the extractors that write them
 #: (indexer/apis/extractor.py, and the add_route callers of indexer/apis/routes.py).
-ENDPOINT_FRAMEWORKS = ("ASP.NET Core", "Django", "Express", "FastAPI", "Flask", "Go", "Spring")
+ENDPOINT_FRAMEWORKS = ("ASP.NET Core", "Django", "Express", "FastAPI", "Flask", "Go", "NestJS", "Spring")
 #: A method filter: an HTTP method token (`GET`, `PROPFIND`), or "*".
 _ENDPOINT_METHOD = re.compile(r"[A-Z][A-Z-]*|\*")
+
+
+def _slashed_endpoint_name(name: str) -> str:
+    """An Endpoint's name with a leading "/" on its path, as list_endpoints
+    gives its `path`: a Django pattern is stored without one (`* orders/` is
+    `* /orders/`). A route under an unknown mount (`"GET ?/:id (file)"`) is
+    left as it is."""
+    method, _, rest = name.partition(" ")
+    return name if rest.startswith(("/", "?")) else f"{method} /{rest}"
 
 
 def _endpoint_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -2425,16 +2648,7 @@ def list_endpoints(
       AND ($prefix IS NULL OR (NOT rest STARTS WITH '?'
            AND ($prefix = '/' OR path = $prefix OR path STARTS WITH $prefix + '/')))
       AND ($service IS NULL OR EXISTS {{ MATCH (e)-[:CALLS]->(s:Service) WHERE s.name = $service }})
-    CALL (e) {{
-        OPTIONAL MATCH (e)-[:IMPLEMENTS]->(f) WHERE f:Function OR f:Class
-        RETURN [h IN collect(DISTINCT {{label: labels(f)[0], name: f.name, file: f.file, owner: f.owner}})
-                WHERE h.name IS NOT NULL]
-               AS handlers
-    }}
-    CALL (e) {{
-        OPTIONAL MATCH (e)-[:CALLS]->(s:Service)
-        RETURN [n IN collect(DISTINCT s.name) WHERE n IS NOT NULL] AS services
-    }}
+    {_ENDPOINT_DETAILS}
     RETURN e.name AS name, e.framework AS framework, coalesce(e.sources, [e.source]) AS files,
            handlers, services, e.repo_id AS repo_id
     ORDER BY (e.repo_id = $repo_id) DESC, e.repo_id, e.name
@@ -2805,7 +3019,7 @@ def get_source(
     WHERE (n:Function OR n:Class) AND {match}
     {repo_filter}
     AND ($file IS NULL OR n.file = $file)
-    {_fold_target("n")}WITH n, folded WHERE folded IS NULL
+    {_fold_target("n")}WITH n, folded WHERE folded IS NULL AND NOT {_shadowed_stub("n")}
     RETURN n.name as name, labels(n) as labels, n.repo_id as repo_id,
            n.file as file, {_OWNER_OF.format(v="n")} as owner, n.start_line as start_line, n.end_line as end_line,
            n.docstring_full as docstring_full
