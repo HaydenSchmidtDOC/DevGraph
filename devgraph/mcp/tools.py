@@ -109,15 +109,22 @@ def _rescan_pending_notice(engine: GraphEngine, registry: RepoRegistry | None, r
     )
     if not used or (used[0]["docs_path"], used[0]["mentions"]) == (repo.docs_path or "", bool(repo.mentions_enabled)):
         return None
+    # The agent's rescan scheduler looks at active, watched repositories only.
+    when = (
+        f"the agent rescans it within about a minute, or run `devgraph rescan {repo_id}`"
+        if repo.active and repo.watch_enabled else f"run `devgraph rescan {repo_id}` to apply it"
+    )
     return (
         f"the docs path or mentions setting of {repo_id} changed since its last full scan, so its docs notes "
-        f"and mentions are not up to date yet; the agent rescans it within about a minute, or run "
-        f"`devgraph rescan {repo_id}`"
+        f"and mentions are not up to date yet; {when}"
     )
 
 
 def _with_notice(result: dict[str, Any], notice: str | None) -> dict[str, Any]:
-    return {**result, "notice": notice} if notice else result
+    """`result` with `notice` added, after any notice it already has (a truncation)."""
+    if not notice:
+        return result
+    return {**result, "notice": f"{result['notice']}; {notice}" if result.get("notice") else notice}
 
 
 #: How long a built-in tool's query may run before it is cancelled.
