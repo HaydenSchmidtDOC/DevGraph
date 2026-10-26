@@ -18,6 +18,8 @@ class _IndexedEngine:
     """A reachable Neo4j recording each repository's index format (None: no index)."""
 
     formats: ClassVar[dict[str, int | None]] = {}
+    #: Repositories whose Repository node is there without a format (an index older than formats).
+    unstamped: ClassVar[set[str]] = set()
 
     def __init__(self, *args, **kwargs):
         pass
@@ -35,10 +37,14 @@ class _IndexedEngine:
         return self.formats.get(repo_id)
 
     def graph_repo_ids(self):
-        return {repo_id for repo_id, fmt in self.formats.items() if fmt is not None}
+        return {repo_id for repo_id, fmt in self.formats.items() if fmt is not None} | self.unstamped
+
+    def run_cypher(self, query, params=None):
+        assert "Repository" in query
+        return [{"present": params["repo_id"] in self.unstamped}]
 
 
-def _doctor(tmp_path, formats, never_indexed=()):
+def _doctor(tmp_path, formats, never_indexed=(), unstamped=()):
     registry = RepoRegistry(tmp_path / "registry.sqlite3")
     for repo_id in [*formats, *never_indexed]:
         root = tmp_path / repo_id
@@ -52,7 +58,7 @@ def _doctor(tmp_path, formats, never_indexed=()):
         neo4j_uri="bolt://127.0.0.1:7687", neo4j_user="neo4j", neo4j_password="devgraph-local-dev",
         health_check_interval_s=30,
     )
-    engine = type("Engine", (_IndexedEngine,), {"formats": formats})
+    engine = type("Engine", (_IndexedEngine,), {"formats": formats, "unstamped": set(unstamped)})
     with patch.object(cli_main, "get_settings", return_value=settings), \
          patch.object(cli_main, "GraphEngine", engine), \
          patch.object(cli_main, "resolve_podman", return_value=None), \
@@ -88,4 +94,13 @@ def test_a_current_index_passes(tmp_path):
     out, result = _doctor(tmp_path, {"zz-current": INDEX_FORMAT})
     assert "[OK]" in _index_lines(out)
     assert "All checks passed" in out
+    assert result.exit_code == 0, out
+
+
+def test_an_index_older_than_formats_is_told_from_a_wiped_one(tmp_path):
+    out, result = _doctor(tmp_path, {"zz-wiped": None, "zz-unstamped": None}, unstamped=("zz-unstamped",))
+    lines = _index_lines(out)
+    assert "[!] zz-wiped: no index in the graph, rescan pending" in lines
+    assert "[!] zz-unstamped: no index format recorded, rescan pending" in lines
+    assert "2 repositories await a rescan" in out
     assert result.exit_code == 0, out

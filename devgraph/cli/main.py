@@ -948,6 +948,21 @@ def _rescan_hint(repo: Any) -> str:
     return "(not watched: run 'devgraph rescan')"
 
 
+def _index_state(engine: GraphEngine, repo_id: str) -> str:
+    """Why a repository's graph index awaits a rescan (`_pending_rescans`): its
+    recorded format is older than the current one; it records none (an index
+    from before formats were stamped); or it is gone (a wiped graph)."""
+    from devgraph.indexer.dispatch import INDEX_FORMAT
+
+    found = engine.index_format(repo_id)
+    if found is not None:
+        return f"index format {found} < {INDEX_FORMAT}"
+    rows = engine.run_cypher(
+        "MATCH (r:Repository {repo_id: $repo_id}) RETURN count(r) > 0 AS present", {"repo_id": repo_id}
+    )
+    return "no index format recorded" if rows and rows[0]["present"] else "no index in the graph"
+
+
 def _print_graph_index(engine: GraphEngine) -> None:
     """The `status` "Graph Index" section: active, indexed repositories whose
     index predates the current format and so await an automatic rescan."""
@@ -1580,18 +1595,17 @@ def doctor(
         index_engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
         try:
             pending_rescans = _pending_rescans(index_engine, present_repos)
-            formats = {repo.repo_id: index_engine.index_format(repo.repo_id) for repo in pending_rescans}
+            states = {repo.repo_id: _index_state(index_engine, repo.repo_id) for repo in pending_rescans}
         except Exception as e:
-            pending_rescans, formats = [], None
+            pending_rescans, states = [], None
             console.print(f"  [yellow][!][/yellow] could not check: {escape(str(e))}")
         finally:
             index_engine.close()
-        if formats == {}:
+        if states == {}:
             current = f"every indexed repository is at index format {INDEX_FORMAT}"
             console.print(f"  [green][OK][/green] {escape(current if present_repos else nothing_to_check)}")
         for repo in pending_rescans:
-            found = formats[repo.repo_id]
-            state = "no index in the graph" if found is None else f"index format {found} < {INDEX_FORMAT}"
+            state = escape(states[repo.repo_id])
             console.print(
                 f"  [yellow][!] {escape(repo.repo_id)}:[/yellow] {state}, rescan pending {_rescan_hint(repo)}",
                 soft_wrap=True,
