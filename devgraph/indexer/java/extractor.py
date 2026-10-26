@@ -32,7 +32,14 @@ from pathlib import Path
 import tree_sitter_java as tsjava
 from tree_sitter import Language, Node, Parser
 
-from devgraph.indexer.apis.routes import add_route, spring_routes
+from devgraph.indexer.apis.routes import (
+    SPRING_CONTROLLERS,
+    add_route,
+    spring_implementer_key,
+    spring_interface_pins,
+    spring_routes,
+    spring_type_names,
+)
 from devgraph.indexer.calls import STOP_METHODS, STOP_TYPES, CallSites, import_rows
 from devgraph.indexer.common import (
     ExtractionResult,
@@ -313,6 +320,7 @@ class _JavaResolver:
         self.statics: dict[str, tuple[list[str], str]] = {}
         self.static_wildcards: list[tuple[list[str], str]] = []
         self.wildcards: list[list[str]] = []
+        self.class_wildcards: list[list[str]] = []  # `import a.b.Outer.*;`: the classes nested in Outer
         self.import_files: set[str] = set()
         self.import_pins: set[str] = set()
         for dotted, is_static, is_wildcard in _extract_imports(root, source):
@@ -335,7 +343,9 @@ class _JavaResolver:
                     self.static_wildcards.append(owner)
                 elif at < len(segments) - 1:
                     self.statics[segments[-1]] = owner
-            elif not is_wildcard:
+            elif is_wildcard:
+                self.class_wildcards.append(segments)
+            else:
                 self.types[segments[-1]] = owner
                 # Its members' owner: a nested class's is dotted (`Settings.Defaults`).
                 self.type_owners[segments[-1]] = ".".join(segments[at:])
@@ -575,9 +585,29 @@ def _annotations(node: Node, source: bytes) -> dict[str, dict[str, list[str] | N
     return found
 
 
-def _spring_routes(root: Node, source: bytes, result: ExtractionResult, file_path: str, repo_id: str) -> None:
+def _written_type(node: Node, source: bytes) -> str:
+    """A type as written, its type arguments left off (`a.B<C>` -> a.B)."""
+    if node.type == "generic_type" and node.named_children:
+        node = node.named_children[0]
+    return "".join(_text(node, source).split())
+
+
+def _spring_routes(
+    root: Node, source: bytes, result: ExtractionResult, file_path: str, repo_id: str, resolver: _JavaResolver,
+) -> dict[tuple[str, str], set[str]]:
     """A Spring controller's mapped methods as Endpoints (apis/routes.py),
-    each implemented by its method, owned by its class."""
+    each implemented by its method, owned by its class; an interface's
+    mapped methods too, implemented by its method and each implementing
+    controller's (`spring_interface_pins`). Returns the match keys
+    (`spring_implementer_key`) of each controller method (name, owner) for
+    the interfaces its class implements, by their qualified names
+    (`spring_type_names`, through the file's package and imports). A
+    controller with a `@RequestMapping` of its own gets none: Spring maps
+    its interface methods under its own prefix, which no interface's route
+    names (see the README's current limitations)."""
+    keys: dict[tuple[str, str], set[str]] = {}
+    package = resolver.layout.package
+    imported = {name: ".".join([*owner[0], resolver.type_owners[name]]) for name, owner in resolver.types.items()}
 
     def walk(block: Node, classes: list[str]) -> None:
         for node in block.named_children:
@@ -587,15 +617,29 @@ def _spring_routes(root: Node, source: bytes, result: ExtractionResult, file_pat
                 continue
             inner = [_text(name, source), *classes]
             mapped = _annotations(node, source)
+            interface = node.type == "interface_declaration"
+            implemented = _child_of_type(node, "super_interfaces")
+            implemented = implemented.named_children[0].named_children \
+                if implemented is not None and implemented.named_children else []
             for member in _members(body):
                 method = member.child_by_field_name("name")
                 if member.type == "method_declaration" and method is not None:
-                    for http_method, path in spring_routes(mapped, _annotations(member, source)):
+                    pins = spring_interface_pins(
+                        file_path, _owner_of(inner), ".".join([*package, _owner_of(inner)])
+                    ) if interface else None
+                    for http_method, path, mounted in spring_routes(mapped, _annotations(member, source), interface):
                         add_route(result, repo_id, file_path, "Spring", http_method, path, _text(method, source),
-                                  _owner_of(inner))
+                                  _owner_of(inner), pins, mounted)
+                    if SPRING_CONTROLLERS & set(mapped) and "RequestMapping" not in mapped and implemented:
+                        keys.setdefault((_text(method, source), _owner_of(inner)), set()).update(
+                            spring_implementer_key(name) for each in implemented
+                            for name in spring_type_names(_written_type(each, source), package, imported,
+                                                          [*resolver.wildcards, *resolver.class_wildcards])
+                        )
             walk(body, inner)
 
     walk(root, [])
+    return keys
 
 
 def _merge_constant_members(result: ExtractionResult, constant_members: set[int]) -> None:
@@ -811,11 +855,14 @@ def extract_java_file(source_code: str, file_path: str, repo_id: str) -> Extract
     visit_block(root, None, "Module", [])
     _merge_constant_members(result, constant_members)
     result.relationships += sites.rows(file_path, repo_id)
-    _spring_routes(root, source_bytes, result, file_path, repo_id)
+    implementer_keys = _spring_routes(root, source_bytes, result, file_path, repo_id, resolver)
     add_heir_keys(result, [
         (name, owner, resolver.bases.get(name, []), methods)
         for name, methods in resolver.methods.items() for owner in resolver.owners.get(name, ())
     ])
+    for node in result.nodes:
+        if node.label == "Function" and (keys := implementer_keys.get((node.name, node.properties.get("owner")))):
+            node.properties["mkeys"] = sorted({*node.properties.get("mkeys", ()), *keys})
 
     return own_edges(result, file_path)
 

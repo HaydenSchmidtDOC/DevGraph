@@ -85,18 +85,20 @@ Known scope cuts (documented, not silently dropped):
     EXTENDS targets from an implementing class's base_list — they just never
     resolve to a real Class node, which is the same non-materializing-guess
     behavior IMPORTS targets get.
-  - Local functions (`local_function_statement`) and lambda bodies are not
-    extracted as their own Function nodes and are not treated as CALLS
-    scope boundaries — calls inside a lambda are attributed to the
-    enclosing method (matching Python's own lambda behavior, since a Python
-    lambda isn't a `function_definition` node either); calls inside a local
-    function ARE excluded from the enclosing method's CALLS (the walk stops
-    descending at `local_function_statement`, same treatment as a nested
-    `def`), they're simply not attributed anywhere.
-  - Top-level statements (C# 9+ `Program.cs` style, code with no enclosing
-    class) are not modeled — there's no enclosing Function/Class to attach
-    CALLS to, and this is a rare style in mid-size/library code, which is
-    what the golden-repo parity bar targets.
+  - A method's local functions (`local_function_statement`) and lambda
+    bodies are not extracted as their own Function nodes and are not
+    treated as CALLS scope boundaries — calls inside a lambda are
+    attributed to the enclosing method (matching Python's own lambda
+    behavior, since a Python lambda isn't a `function_definition` node
+    either); calls inside a local function ARE excluded from the enclosing
+    method's CALLS (the walk stops descending at `local_function_statement`,
+    same treatment as a nested `def`), they're simply not attributed
+    anywhere.
+  - Top-level statements (C# 9+ `Program.cs` style, the default template
+    since .NET 6): their calls are the Module's, and their local functions
+    (`static IResult GetTodos() {...}`) are top-level Functions (owner "")
+    whose calls are their own; a call to one from top-level code or another
+    such function links it in the file.
   - A `<ProjectReference>`'s `Condition` or `$(...)` is not evaluated
     (resolver_config); `ImplicitUsings` is read for Microsoft.NET.Sdk and
     its Web and Worker SDKs only.
@@ -555,6 +557,12 @@ class _CsResolver:
             if name is not None:
                 self.type_params.add(_text(name, source))
         self._collect(root, ())
+        # Top-level statements' local functions (`static IResult GetTodos() {...}` in Program.cs).
+        self.top_functions = {
+            _text(name, source) for each in root.named_children if each.type == "global_statement"
+            for local in each.named_children[:1] if local.type == "local_function_statement"
+            if (name := local.child_by_field_name("name")) is not None
+        }
         self.methods: set[str] = set().union(*(info.methods for info in self.classes.values()))  # declared here
 
     def scope(self, node: Node) -> _CsScope:
@@ -913,11 +921,15 @@ class _CsCalls:
             self._bare(name, True)
 
     def call(self, node: Node) -> None:
+        function = node.child_by_field_name("function")
+        if function is not None:
+            self.callee(function)
+
+    def callee(self, function: Node) -> None:
+        """A call's callee expression (or a method group, a minimal-API
+        handler) resolved as `call` resolves it."""
         source = self.resolver.source
         resolver = self.resolver
-        function = node.child_by_field_name("function")
-        if function is None:
-            return
         if function.type == "generic_name":
             function = next((c for c in function.named_children if c.type == "identifier"), None)
             if function is None:
@@ -927,6 +939,8 @@ class _CsCalls:
             if name in self.locals or name in self.variables:
                 return  # a local function or a delegate
             target = self._own(name)
+            if not target.files and not self.classes and name in resolver.top_functions:
+                target.files.add(owned_pin(resolver.file_path, ""))  # a top-level local function
             if not target.files:
                 for static in self.scope.statics:
                     simple = static[0].rpartition(".")[2]
@@ -1093,6 +1107,28 @@ def _route_attributes(node: Node, source: bytes) -> dict[str, list[str | None]]:
     return found
 
 
+def _map_methods(node: Node, source: bytes) -> list[str]:
+    """`MapMethods`' methods argument as its HTTP methods: an array or
+    collection of string literals or `HttpMethods.X`; none when any item is
+    something else (a variable)."""
+    if node.type in ("array_creation_expression", "implicit_array_creation_expression"):
+        node = next((c for c in node.named_children if c.type == "initializer_expression"), node)
+    if node.type == "element_binding_expression":  # `["GET"]`, as the grammar reads a collection expression
+        items = [arg.named_children[-1] for arg in node.named_children if arg.type == "argument"]
+    elif node.type in ("initializer_expression", "collection_expression"):
+        items = node.named_children
+    else:
+        return []
+    methods = []
+    for item in items:
+        name = item.child_by_field_name("name") if item.type == "member_access_expression" else None
+        literal = _string_literal(item, source)
+        if literal is None and (name is None or _text(item.child_by_field_name("expression"), source) != "HttpMethods"):
+            return []
+        methods.append((literal if literal is not None else _text(name, source)).upper())
+    return sorted(set(methods))
+
+
 #: Minimal-API receivers: an app (a root), or a route builder a caller
 #: passes, mounted under a prefix the file doesn't show.
 _ROOT_BUILDER_TYPES = frozenset({"WebApplication"})
@@ -1100,14 +1136,18 @@ _SCOPE_TYPES = ("method_declaration", "local_function_statement", "constructor_d
                 "anonymous_method_expression", "compilation_unit")
 
 
-def _aspnet_routes(root: Node, source: bytes, result: ExtractionResult, file_path: str, repo_id: str) -> None:
+def _aspnet_routes(
+    root: Node, source: bytes, result: ExtractionResult, file_path: str, repo_id: str, resolver: _CsResolver,
+) -> None:
     """ASP.NET Core routes as Endpoints (apis/routes.py). Attribute routing:
     a controller's (`[ApiController]`, a `[Route]` or a `...Controller`
     name) `[HttpGet("x")]`/`[Route("x")]` actions under each of its
     `[Route]`s, the `[controller]` and `[action]` tokens filled in (any
     case), implemented by the action, owned by its class. Minimal APIs:
-    `app.MapGet("/x", handler)`, implemented by a method of the file it
-    names (a lambda implements nothing). The receiver is followed to its
+    `app.MapGet("/x", handler)` (`MapMethods("/x", new[] {"GET"}, h)` one
+    route per method), implemented by the method of the file it
+    names, else by what a call to it reaches (`TodoHandlers.GetById` in
+    another file, by its class's keys); a lambda implements nothing. The receiver is followed to its
     nearest declaration before the call in its scope (then the enclosing
     ones): `builder.Build()`, `WebApplication.Create...` or a
     `WebApplication` is the root; a literal `MapGroup("/x")` of a known one
@@ -1246,6 +1286,10 @@ def _aspnet_routes(root: Node, source: bytes, result: ExtractionResult, file_pat
         receiver, method = func.child_by_field_name("expression"), func.child_by_field_name("name")
         values = [arg.named_children[-1] for arg in arguments.named_children if arg.type == "argument"]
         verb = _MAP_CALLS.get(_text(method, source)) if method is not None else None
+        verbs = [verb]
+        if method is not None and _text(method, source) == "MapMethods" and len(values) == 3:
+            verbs, values = _map_methods(values[1], source), [values[0], values[2]]
+            verb = "" if verbs else None
         if receiver is None or verb is None or len(values) < 2:
             continue
         path = _string_literal(values[0], source)
@@ -1268,13 +1312,20 @@ def _aspnet_routes(root: Node, source: bytes, result: ExtractionResult, file_pat
                 handler = handler.child_by_field_name("name")
             name = _text(handler, source)
             owners = {o for o in functions.get(name, ()) if qualifier is None or o.rsplit(".", 1)[-1] == qualifier}
-            if len(owners) == 1:
-                add_route(result, repo_id, file_path, "ASP.NET Core", verb, full, name, next(iter(owners)),
-                          mounted=mounted)
-            else:
-                add_route(result, repo_id, file_path, "ASP.NET Core", verb, full, name, pins=set(), mounted=mounted)
+            for verb in verbs:
+                if len(owners) == 1:
+                    add_route(result, repo_id, file_path, "ASP.NET Core", verb, full, name, next(iter(owners)),
+                              mounted=mounted)
+                else:
+                    # As a call to it would resolve (`TodoHandlers.GetById()`), into another file too.
+                    calls = _CsCalls(resolver, _enclosing_classes(call, source), {}, resolver.scope(call))
+                    calls.callee(values[1])
+                    pins = next((each for callee, each, _member in calls.found if callee == name and each), ())
+                    add_route(result, repo_id, file_path, "ASP.NET Core", verb, full, name, pins=set(pins),
+                              mounted=mounted)
         else:
-            add_route(result, repo_id, file_path, "ASP.NET Core", verb, full, mounted=mounted)
+            for verb in verbs:
+                add_route(result, repo_id, file_path, "ASP.NET Core", verb, full, mounted=mounted)
 
 
 def extract_csharp_file(
@@ -1369,6 +1420,11 @@ def extract_csharp_file(
                 _visit_method(node, children, idx, parent_name, parent_label, classes)
             elif node.type == "interface_declaration":
                 continue  # scope cut — see module docstring
+            elif node.type == "global_statement" and parent_label == "Module" and (
+                node.named_children and node.named_children[0].type == "local_function_statement"
+            ):
+                # A top-level statements file's local function: a top-level Function.
+                _visit_method(node.named_children[0], children, idx, parent_name, parent_label, classes)
             else:
                 # Other statement (field/property/top-level code) — attribute
                 # any invocation expressions in it to the enclosing scope.
@@ -1536,7 +1592,7 @@ def extract_csharp_file(
                 "Module", file_path, name, pins, False, None, file_path, repo_id, rel_type="IMPORTS",
                 to_label=to_label,
             )
-    _aspnet_routes(root, source_bytes, result, file_path, repo_id)
+    _aspnet_routes(root, source_bytes, result, file_path, repo_id, resolver)
     # Project visibility: a node's project, and the projects a path-pinned
     # row of a file in a project may link nodes of.
     proj = _project_key(project.dir) if project is not None else ""
