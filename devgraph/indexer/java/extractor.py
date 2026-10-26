@@ -38,6 +38,7 @@ from devgraph.indexer.apis.routes import (
     spring_implementer_key,
     spring_interface_pins,
     spring_routes,
+    spring_type_names,
 )
 from devgraph.indexer.calls import STOP_METHODS, STOP_TYPES, CallSites, import_rows
 from devgraph.indexer.common import (
@@ -581,16 +582,26 @@ def _annotations(node: Node, source: bytes) -> dict[str, dict[str, list[str] | N
     return found
 
 
+def _written_type(node: Node, source: bytes) -> str:
+    """A type as written, its type arguments left off (`a.B<C>` -> a.B)."""
+    if node.type == "generic_type" and node.named_children:
+        node = node.named_children[0]
+    return "".join(_text(node, source).split())
+
+
 def _spring_routes(
-    root: Node, source: bytes, result: ExtractionResult, file_path: str, repo_id: str,
+    root: Node, source: bytes, result: ExtractionResult, file_path: str, repo_id: str, resolver: _JavaResolver,
 ) -> dict[tuple[str, str], set[str]]:
     """A Spring controller's mapped methods as Endpoints (apis/routes.py),
     each implemented by its method, owned by its class; an interface's
     mapped methods too, implemented by its method and each implementing
     controller's (`spring_interface_pins`). Returns the match keys
     (`spring_implementer_key`) of each controller method (name, owner) for
-    the interfaces its class implements."""
+    the interfaces its class implements, by their qualified names
+    (`spring_type_names`, through the file's package and imports)."""
     keys: dict[tuple[str, str], set[str]] = {}
+    package = resolver.layout.package
+    imported = {name: ".".join([*owner[0], resolver.type_owners[name]]) for name, owner in resolver.types.items()}
 
     def walk(block: Node, classes: list[str]) -> None:
         for node in block.named_children:
@@ -607,13 +618,17 @@ def _spring_routes(
             for member in _members(body):
                 method = member.child_by_field_name("name")
                 if member.type == "method_declaration" and method is not None:
-                    pins = spring_interface_pins(file_path, _owner_of(inner), inner[0]) if interface else None
+                    pins = spring_interface_pins(
+                        file_path, _owner_of(inner), ".".join([*package, _owner_of(inner)])
+                    ) if interface else None
                     for http_method, path in spring_routes(mapped, _annotations(member, source), interface):
                         add_route(result, repo_id, file_path, "Spring", http_method, path, _text(method, source),
                                   _owner_of(inner), pins)
                     if SPRING_CONTROLLERS & set(mapped) and implemented:
                         keys.setdefault((_text(method, source), _owner_of(inner)), set()).update(
-                            spring_implementer_key(_simple_type_name(each, source)) for each in implemented
+                            spring_implementer_key(name) for each in implemented
+                            for name in spring_type_names(_written_type(each, source), package, imported,
+                                                          resolver.wildcards)
                         )
             walk(body, inner)
 
@@ -834,7 +849,7 @@ def extract_java_file(source_code: str, file_path: str, repo_id: str) -> Extract
     visit_block(root, None, "Module", [])
     _merge_constant_members(result, constant_members)
     result.relationships += sites.rows(file_path, repo_id)
-    implementer_keys = _spring_routes(root, source_bytes, result, file_path, repo_id)
+    implementer_keys = _spring_routes(root, source_bytes, result, file_path, repo_id, resolver)
     add_heir_keys(result, [
         (name, owner, resolver.bases.get(name, []), methods)
         for name, methods in resolver.methods.items() for owner in resolver.owners.get(name, ())

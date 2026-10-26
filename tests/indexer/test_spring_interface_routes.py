@@ -7,7 +7,7 @@ each controller class implementing it. Fixture code is fictional."""
 from devgraph.indexer.java.extractor import extract_java_file
 from devgraph.indexer.kotlin.extractor import extract_kotlin_file
 
-IMPLEMENTERS = "/.?.java,.kt^t@spring:OrdersApi"
+IMPLEMENTERS = "/.?.java,.kt^t@spring:shop.api.OrdersApi"
 
 JAVA_API = """\
 package shop.api;
@@ -68,8 +68,9 @@ def test_java_interface_mappings_are_endpoints():
 def test_java_controller_methods_carry_the_interface_key():
     result = extract_java_file(JAVA_CONTROLLER, "src/main/java/shop/web/OrdersController.java", "r")
     keys = _mkeys(result)
-    assert keys[("getOrder", "OrdersController")] == ["spring:Auditable", "spring:OrdersApi"]
-    assert keys[("helper", "OrdersController")] == ["spring:Auditable", "spring:OrdersApi"]
+    expected = ["spring:shop.api.OrdersApi", "spring:shop.web.Auditable"]
+    assert keys[("getOrder", "OrdersController")] == expected
+    assert keys[("helper", "OrdersController")] == expected
     assert _endpoints(result) == set()
 
 
@@ -102,6 +103,8 @@ interface OrdersApi {
 KOTLIN_CONTROLLER = """\
 package shop.web
 
+import shop.api.OrdersApi
+
 @RestController
 class OrdersController(private val service: OrderService) : OrdersApi {
     override fun getOrder(id: Long): Order = service.find(id)
@@ -117,4 +120,4 @@ def test_kotlin_interface_mappings_and_controller_keys():
     assert ("GET /api/v1/orders/{id}", "getOrder", path, "OrdersApi") in implements
     assert ("GET /api/v1/orders/{id}", "getOrder", IMPLEMENTERS, None) in implements
     controller = extract_kotlin_file(KOTLIN_CONTROLLER, "src/main/kotlin/shop/web/OrdersController.kt", "r")
-    assert _mkeys(controller)[("getOrder", "OrdersController")] == ["spring:OrdersApi"]
+    assert _mkeys(controller)[("getOrder", "OrdersController")] == ["spring:shop.api.OrdersApi"]

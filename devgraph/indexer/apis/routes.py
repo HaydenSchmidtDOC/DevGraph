@@ -140,15 +140,31 @@ def spring_routes(
 
 def spring_implementer_key(interface: str) -> str:
     """The match key (`mkeys`) a controller class's methods carry for each
-    interface it implements, by the interface's simple name."""
+    interface it implements, by the interface's qualified name
+    (`spring_type_names`)."""
     return f"spring:{interface}"
 
 
+def spring_type_names(written: str, package: list[str], imported: dict[str, str], wildcards: list[list[str]]) -> list[str]:
+    """The qualified names a type its file writes as `written` (its type
+    arguments left off) can have: `written` itself when qualified by a
+    package (`com.x.AuditApi`); else, its first segment taken as a class
+    (`OrdersApi`, `Outer.Api`), the class an explicit import of it names
+    (`imported`: name -> qualified name), else that class in the file's own
+    `package` or in each wildcard-imported package."""
+    head, dot, rest = written.partition(".")
+    if dot and not head[:1].isupper():
+        return [written]
+    if head in imported:
+        return [imported[head] + dot + rest]
+    return [".".join([*each, written]) for each in [package, *wildcards]]
+
+
 def spring_interface_pins(file_path: str, owner: str, interface: str) -> set[str]:
-    """Where the handler of a route an interface `interface` (its members'
-    owner `owner`) of `file_path` maps is: the interface's own method, and
-    the same-named method of every controller class implementing it, in
-    any file (`spring_implementer_key`)."""
+    """Where the handler of a route an interface of `file_path` maps is:
+    the interface's own method (its members' owner `owner`), and the
+    same-named method of every controller class implementing it, in any
+    file, by its qualified name `interface` (`spring_implementer_key`)."""
     return {owned_pin(file_path, owner), scoped_pin(_SPRING_SOURCES, [spring_implementer_key(interface)])}
 
 

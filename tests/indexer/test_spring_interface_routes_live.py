@@ -82,6 +82,8 @@ public class OrdersController implements OrdersApi {
 KOTLIN = """\
 package shop.web
 
+import shop.api.OrdersApi
+
 @RestController
 class LegacyOrders : OrdersApi {
     override fun getOrder(id: Long): Order = TODO()

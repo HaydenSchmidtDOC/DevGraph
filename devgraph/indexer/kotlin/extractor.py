@@ -71,6 +71,7 @@ from devgraph.indexer.apis.routes import (
     spring_implementer_key,
     spring_interface_pins,
     spring_routes,
+    spring_type_names,
 )
 from devgraph.indexer.calls import (
     STOP_METHODS,
@@ -835,13 +836,34 @@ def _annotations(node: Node, source: bytes) -> dict[str, dict[str, list[str] | N
     return found
 
 
-def _spring_routes(top_level: list[Node], source: bytes, result: ExtractionResult, file_path: str, repo_id: str) -> None:
+def _written_supertypes(node: Node, source: bytes) -> list[str]:
+    """A class's supertypes as written (`_extract_supertype_names`), type
+    arguments left off: `com.x.Api`, `CrudApi<A, B>` -> CrudApi."""
+    specifiers = _child_of_type(node, "delegation_specifiers")
+    written = []
+    for child in specifiers.named_children if specifiers is not None else []:
+        user_type = _child_of_type(child, "user_type") if child.type == "delegation_specifier" else None
+        invocation = _child_of_type(child, "constructor_invocation") if child.type == "delegation_specifier" else None
+        if user_type is None and invocation is not None:
+            user_type = _child_of_type(invocation, "user_type")
+        if user_type is not None:
+            written.append("".join(_text(user_type, source).split("<", 1)[0].split()))
+    return written
+
+
+def _spring_routes(
+    top_level: list[Node], source: bytes, result: ExtractionResult, file_path: str, repo_id: str,
+    resolver: _KotlinResolver,
+) -> None:
     """A Spring controller's mapped functions as Endpoints (apis/routes.py),
     each implemented by its function, owned by its class; an interface's
     mapped functions too, implemented by its function and each implementing
     controller's (`spring_interface_pins`), whose functions carry a match
-    key (`spring_implementer_key`) for each of its class's supertypes."""
+    key (`spring_implementer_key`) for each qualified name each of its
+    class's supertypes can have (`spring_type_names`)."""
     keys: dict[tuple[str, str], set[str]] = {}
+    package = resolver.layout.package
+    imported = {name: ".".join([*owner[0], owner[1]]) for name, owner in resolver.types.items()}
 
     def walk(nodes: list[Node], classes: list[str]) -> None:
         for node in nodes:
@@ -852,11 +874,16 @@ def _spring_routes(top_level: list[Node], source: bytes, result: ExtractionResul
             inner = [_text(name, source), *classes]
             mapped = _annotations(node, source)
             interface = _child_of_type(node, "interface") is not None
-            supertypes = _extract_supertype_names(node, source) if SPRING_CONTROLLERS & set(mapped) else []
+            supertypes = [
+                each for written in _written_supertypes(node, source)
+                for each in spring_type_names(written, package, imported, resolver.wildcards)
+            ] if SPRING_CONTROLLERS & set(mapped) else []
             for member in body.named_children:
                 function = member.child_by_field_name("name")
                 if member.type == "function_declaration" and function is not None:
-                    pins = spring_interface_pins(file_path, _owner_of(inner), inner[0]) if interface else None
+                    pins = spring_interface_pins(
+                        file_path, _owner_of(inner), ".".join([*package, _owner_of(inner)])
+                    ) if interface else None
                     for http_method, path in spring_routes(mapped, _annotations(member, source), interface):
                         add_route(result, repo_id, file_path, "Spring", http_method, path, _text(function, source),
                                   _owner_of(inner), pins)
@@ -1087,7 +1114,7 @@ def extract_kotlin_file(source_code: str, file_path: str, repo_id: str) -> Extra
 
     visit_block(root, None, "Module", [], top_level)
     result.relationships += sites.rows(file_path, repo_id)
-    _spring_routes(top_level, source_bytes, result, file_path, repo_id)
+    _spring_routes(top_level, source_bytes, result, file_path, repo_id, resolver)
 
     return own_edges(result, file_path)
 
