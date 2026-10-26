@@ -1534,8 +1534,9 @@ def trace_request_flow(
 
     Returns:
         Dict with `components` (the start endpoints and every node within five
-        hops, each {name, labels, repo_id, file, owner}: file null and owner
-        left out for a node with no file) and `edges` ({type, from, to} per
+        hops, each {name, labels, repo_id, file, owner}: an endpoint's file is
+        its route file, and file is null and owner left out for any other node
+        with no file) and `edges` ({type, from, to} per
         relationship, `from`/`to` naming its components). A route's handler
         stub that folds into a real Function is listed as that Function, its
         edges with it, and the flow goes on from the Function's calls (four
@@ -1549,7 +1550,10 @@ def trace_request_flow(
     """
     repo_filter = _cross_scope("start", "AND") if cross_repo else "AND start.repo_id = $repo_id"
     node = (
-        "{id: elementId(n), name: n.name, labels: labels(n), repo_id: n.repo_id, file: n.file, owner: "
+        # An Endpoint has no file of its own: its route file (`source`). A
+        # handler stub's `source` is a route file too, not its own: it stays null.
+        "{id: elementId(n), name: n.name, labels: labels(n), repo_id: n.repo_id, "
+        "file: coalesce(n.file, CASE WHEN n:Endpoint THEN n.source END), owner: "
         + _OWNER_OF.format(v="n") + "}"
     )
     edge = "{id: elementId(r), type: type(r), start: elementId(startNode(r)), end: elementId(endNode(r))}"

@@ -135,3 +135,11 @@ def test_ambiguous_targets_leave_the_folded_stub_out(engine, repo_id, tool):
     assert sorted(r["file"] for r in ambiguous["results"]) == [
         f"src/main/java/shop/{n.title()}Controller.java" for n in sorted(CONTROLLERS)
     ]
+
+
+def test_a_traced_endpoint_names_its_route_file(engine, repo_id):
+    components = tools.trace_request_flow(engine, repo_id, "GET /users")["components"]
+    (endpoint,) = [c for c in components if c["labels"] == ["Endpoint"]]
+    assert endpoint["file"] == "src/main/java/shop/UsersController.java" and "owner" not in endpoint
+    legacy = tools.trace_request_flow(engine, repo_id, "POST /legacy")["components"]
+    assert [(c["name"], c["file"]) for c in legacy] == [("POST /legacy", "web/app.js"), ("create", None)]
