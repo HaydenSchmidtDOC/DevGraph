@@ -52,7 +52,7 @@ def get_git_log(repo_path: Path, limit: int) -> list[dict[str, Any]]:
 def get_git_status(repo_path: Path) -> dict[str, Any]:
     """Real working-tree state: current branch + modified/untracked paths.
 
-    Uses `git status --porcelain` directly (same approach as `mcp/tools.py`'s
+    Uses `git status --porcelain=v1 -z` directly (same approach as `mcp/tools.py`'s
     other `git_repo.git.<cmd>()` calls) rather than GitPython's diff/index
     APIs, which is simpler to get right for the modified/untracked/staged
     distinction the porcelain format already encodes per-line.
@@ -66,14 +66,25 @@ def get_git_status(repo_path: Path) -> dict[str, Any]:
             except (ValueError, TypeError):
                 branch = "no commits yet"
 
-        porcelain = repo.git.status("--porcelain")
+        # `-z`: paths as they are, NUL-terminated (without it a path with a
+        # space or a non-ASCII character is C-quoted), and a rename or copy
+        # as two records, the new path then the one it came from.
+        records = repo.git.status("--porcelain=v1", "-z").split("\0")
         entries: list[dict[str, str]] = []
-        for line in porcelain.splitlines():
-            if not line.strip():
+        i = 0
+        while i < len(records):
+            record = records[i]
+            i += 1
+            if len(record) < 4:
                 continue
-            code, path = line[:2], line[3:]
+            code, path = record[:2], record[3:]
+            old_path = None
             if code == "??":
                 state = "untracked"
+            elif "R" in code or "C" in code:
+                state = "renamed" if "R" in code else "copied"
+                old_path = records[i]
+                i += 1
             elif "M" in code:
                 state = "modified"
             elif "A" in code:
@@ -82,6 +93,9 @@ def get_git_status(repo_path: Path) -> dict[str, Any]:
                 state = "deleted"
             else:
                 state = "changed"
-            entries.append({"path": path, "state": state})
+            entry = {"path": path, "state": state}
+            if old_path is not None:
+                entry["old_path"] = old_path
+            entries.append(entry)
 
         return {"branch": branch, "uncommitted": entries}
