@@ -662,7 +662,8 @@ def build_server(
     ) -> dict[str, Any]:
         """Return the most-connected nodes in the graph — the core abstractions
         a new agent should look at first to orient itself in an unfamiliar repo.
-        Returns {count, results, truncated} with degree (number of direct relationships)."""
+        Returns {count, results, truncated} with degree (number of direct relationships).
+        Git history (commits, PRs, issues) and mentions documents are left out."""
         return devgraph_tools.god_nodes(
             engine, repo_id, cross_repo, max_results,
             declared_labels=(

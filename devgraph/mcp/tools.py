@@ -1223,6 +1223,11 @@ def describe_node(
 
 #: Most results god_nodes returns, whatever max_results asks for.
 _GOD_NODES_MAX = 500
+#: What god_nodes leaves out: git history and mentions describe how the code
+#: changed and where it is named, not its structure. A sweep commit's degree is
+#: every file it touched, and each commit adds one to every file it touched.
+_GOD_NODES_SKIPPED_LABELS = ("Commit", "PullRequest", "Issue", "Document")
+_GOD_NODES_SKIPPED_RELATIONSHIPS = ("MODIFIES", "RESOLVES", "REFERENCES", "MENTIONS")
 
 
 def god_nodes(
@@ -1246,12 +1251,16 @@ def god_nodes(
 
     Returns:
         Dict with count (nodes ranked), results, and truncated flag. Each result
-        has name, labels, repo_id, and degree (number of direct relationships).
-        `Repository` nodes are not ranked.
+        has name, labels, repo_id, and degree (number of direct relationships,
+        git-history and mentions edges left out). `Repository`, git-history
+        (`Commit`, `PullRequest`, `Issue`) and mentions `Document` nodes are
+        not ranked, so a sweep commit or a file edited often never outranks
+        the code.
     """
     _at_least(1, max_results=max_results)
     declared = tuple(d for d in dict.fromkeys(declared_labels) if LABEL_PATTERN.fullmatch(d))
-    labels = _DESCRIBE_BUILTIN_LABELS + tuple(d for d in declared if d not in _DESCRIBE_BUILTIN_LABELS)
+    builtin = tuple(label for label in _DESCRIBE_BUILTIN_LABELS if label not in _GOD_NODES_SKIPPED_LABELS)
+    labels = builtin + tuple(d for d in declared if d not in _DESCRIBE_BUILTIN_LABELS)
     repo_filter = _cross_scope("n") if cross_repo else "n.repo_id = $repo_id"
     # One branch per label, so each is a label scan rather than a scan of every
     # node; UNION drops a node reached through two of its labels.
@@ -1262,12 +1271,14 @@ def god_nodes(
     CALL () {{
 {nodes}
     }}
-    WITH n, COUNT {{ (n)--() }} AS degree
+    WITH n, COUNT {{ (n)-[r]-() WHERE NOT type(r) IN $skipped }} AS degree
     ORDER BY degree DESC, n.name
     WITH collect({{name: n.name, labels: labels(n), repo_id: n.repo_id, degree: degree}}) AS ranked
     RETURN size(ranked) AS total, ranked[0..$limit] AS top
     """
-    params: dict[str, Any] = {"limit": limit} if cross_repo else {"repo_id": repo_id, "limit": limit}
+    params: dict[str, Any] = {"limit": limit, "skipped": list(_GOD_NODES_SKIPPED_RELATIONSHIPS)}
+    if not cross_repo:
+        params["repo_id"] = repo_id
     (row,) = _query(engine, cypher, params)
     envelope = _envelope(row["top"], limit)
     envelope["count"] = row["total"]
