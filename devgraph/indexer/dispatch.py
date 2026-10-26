@@ -243,9 +243,12 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: `add_url_rule` (a `MethodView.as_view` view IMPLEMENTS its Class and its
 #: HTTP method handlers) and FastAPI `add_api_route` routes
 #: (apis/extractor.py `_rule_views`); NestJS controllers' routes (jsts
-#: `_nest_routes`) and Fastify's `route({ method, url, handler })`.
+#: `_nest_routes`) and Fastify's `route({ method, url, handler })`; 22:
+#: git commit dates and recency in UTC (git_history `HISTORY_FORMAT` 2, its
+#: own stamp: a full scan writes no history, so the repository's next
+#: history sync rewrites every commit and recency).
 #: An index stamped lower, or not at all, is rescanned automatically.
-INDEX_FORMAT = 21
+INDEX_FORMAT = 22
 
 
 def index_outdated(engine: GraphEngine, repo_id: str) -> bool:

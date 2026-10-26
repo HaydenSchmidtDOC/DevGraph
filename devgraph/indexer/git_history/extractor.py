@@ -20,6 +20,7 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import timezone
 from pathlib import Path
 
 from git import GitCommandError, Repo
@@ -36,6 +37,11 @@ CHUNK_ROWS = 1000
 #: How often, at most, a sync offers its batch lock to waiting live
 #: batches (`between_chunks`).
 YIELD_EVERY_S = 0.5
+#: The format of the history a sync writes, stamped on the Repository node
+#: (`history_format`). 1 (unstamped): dates kept their author's UTC offset;
+#: 2 (INDEX_FORMAT 22): dates in UTC, so ISO strings sort as instants. A
+#: graph holding commits of an older format is reconciled by its next sync.
+HISTORY_FORMAT = 2
 
 
 class _Stopped(Exception):
@@ -139,7 +145,7 @@ class GitHistoryExtractor:
                         properties={
                             "message": (commit.message or "").strip(),
                             "author": commit.author.name if commit.author else None,
-                            "authored_date": commit.authored_datetime.isoformat(),
+                            "authored_date": commit.authored_datetime.astimezone(timezone.utc).isoformat(),
                         },
                     )
                 )
@@ -478,6 +484,20 @@ def _sync(
     return len(result.commits), 0
 
 
+def _history_outdated(engine, repo_id: str) -> bool:
+    """True when the graph holds the repository's commits written in a
+    format older than HISTORY_FORMAT (an upgrade): the next sync reconciles
+    them, which rewrites every commit and recency. A graph without its
+    commits needs no rewrite (its first sync writes the current format)."""
+    rows = engine.run_cypher(
+        "MATCH (r:Repository {repo_id: $repo_id}) "
+        "RETURN coalesce(r.history_format, 1) >= $version "
+        "OR NOT EXISTS { MATCH (:Commit {repo_id: $repo_id}) } AS current",
+        {"repo_id": repo_id, "version": HISTORY_FORMAT},
+    )
+    return bool(rows) and not rows[0]["current"]
+
+
 def sync_git_history(
     engine, registry, repo_id: str, max_count: int | None = None, force: bool = False,
     on_initial: Callable[[int], None] | None = None, between_chunks: Callable[[], bool] | None = None,
@@ -502,6 +522,8 @@ def sync_git_history(
             for repairing a graph whose MODIFIES edges were destroyed by a
             bug (e.g. the old replace_file_nodes blanket-delete) — the
             normal fast/noop path would otherwise never re-create them.
+            A graph holding commits of an older `HISTORY_FORMAT` is
+            reconciled the same way without it (an upgrade).
         on_initial: Called with the number of commits a *first* sync is about
             to read, before it reads them (the agent logs it: a first sync of
             a long history takes a while).
@@ -546,11 +568,14 @@ def sync_git_history(
         # A shallow clone deepened (or unshallowed) since: commits read as
         # boundaries then, with every file as touched, have parents now.
         reshaped = last is not None and shallow != repo_record.last_indexed_shallow
+        outdated = _history_outdated(engine, repo_id)
 
-        if last == head_sha and not force and not reshaped:
+        if last == head_sha and not force and not reshaped and not outdated:
             return {"mode": "noop", "commits_indexed": 0, "commits_deleted": 0}
 
-        if last is None:
+        if outdated:
+            mode = "reconcile"  # every commit and recency written again
+        elif last is None:
             mode = "initial"
         elif force or reshaped or not _is_ancestor(repo, last, head_sha):
             mode = "reconcile"
@@ -578,6 +603,10 @@ def sync_git_history(
                 f"(first {failed[0]!r}: {blame_failures[failed[0]]})"
             )
 
+        engine.run_cypher(
+            "MATCH (r:Repository {repo_id: $repo_id}) SET r.history_format = $version",
+            {"repo_id": repo_id, "version": HISTORY_FORMAT},
+        )
         registry.set_last_indexed_commit(repo_id, head_sha, shallow)
         return {"mode": mode, "commits_indexed": commits_indexed, "commits_deleted": commits_deleted}
     finally:
