@@ -74,3 +74,25 @@ def test_god_nodes_ranking_is_unchanged_by_git_history(engine, history_repo):
     after = tools.god_nodes(engine, repo_id, max_results=50)
     assert after == before
     assert not any("Commit" in row["labels"] for row in after["results"])
+
+
+def test_god_nodes_leaves_out_mentions_prs_and_issues(engine, history_repo):
+    """A mentions Document, a PullRequest and an Issue, and their MENTIONS,
+    RESOLVES and REFERENCES edges, are neither ranked nor counted."""
+    registry, repo_id = history_repo
+    assert sync_git_history(engine, registry, repo_id)
+    before = tools.god_nodes(engine, repo_id, max_results=50)
+    (sha,) = (r["sha"] for r in engine.run_cypher(
+        "MATCH (c:Commit {repo_id: $r, message: 'init'}) RETURN c.name AS sha", {"r": repo_id}
+    ))
+    engine.upsert_node("Document", repo_id, "README.md")
+    for target in ("core.py", "m1.py", "m2.py"):
+        engine.upsert_relationship("Document", "README.md", "MENTIONS", "Module", target, repo_id)
+    engine.upsert_node("Issue", repo_id, "42")
+    engine.upsert_node("PullRequest", repo_id, "7")
+    engine.upsert_relationship("Commit", sha, "REFERENCES", "Issue", "42", repo_id)
+    engine.upsert_relationship("PullRequest", "7", "RESOLVES", "Issue", "42", repo_id)
+    after = tools.god_nodes(engine, repo_id, max_results=50)
+    assert after == before
+    skipped = {"Commit", "PullRequest", "Issue", "Document"}
+    assert not any(skipped & set(row["labels"]) for row in after["results"])
