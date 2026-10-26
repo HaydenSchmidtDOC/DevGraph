@@ -320,6 +320,7 @@ class _JavaResolver:
         self.statics: dict[str, tuple[list[str], str]] = {}
         self.static_wildcards: list[tuple[list[str], str]] = []
         self.wildcards: list[list[str]] = []
+        self.class_wildcards: list[list[str]] = []  # `import a.b.Outer.*;`: the classes nested in Outer
         self.import_files: set[str] = set()
         self.import_pins: set[str] = set()
         for dotted, is_static, is_wildcard in _extract_imports(root, source):
@@ -342,7 +343,9 @@ class _JavaResolver:
                     self.static_wildcards.append(owner)
                 elif at < len(segments) - 1:
                     self.statics[segments[-1]] = owner
-            elif not is_wildcard:
+            elif is_wildcard:
+                self.class_wildcards.append(segments)
+            else:
                 self.types[segments[-1]] = owner
                 # Its members' owner: a nested class's is dotted (`Settings.Defaults`).
                 self.type_owners[segments[-1]] = ".".join(segments[at:])
@@ -631,7 +634,7 @@ def _spring_routes(
                         keys.setdefault((_text(method, source), _owner_of(inner)), set()).update(
                             spring_implementer_key(name) for each in implemented
                             for name in spring_type_names(_written_type(each, source), package, imported,
-                                                          resolver.wildcards)
+                                                          [*resolver.wildcards, *resolver.class_wildcards])
                         )
             walk(body, inner)
 

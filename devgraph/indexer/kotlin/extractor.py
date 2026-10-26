@@ -502,6 +502,11 @@ class _KotlinResolver:
         self.types: dict[str, tuple[list[str], str]] = {}
         self.imported_functions: dict[str, list[str]] = {}
         self.wildcards: list[list[str]] = []
+        # A nested class imported by name (`import a.b.Outer.Api`) -> its
+        # qualified name, and the classes a class's wildcard imports
+        # (`import a.b.Outer.*`): the types a supertype can name.
+        self.nested_types: dict[str, str] = {}
+        self.class_wildcards: list[list[str]] = []
         self.symbol_imports: list[tuple[str, str, list[str]]] = []  # (label, name, pins)
         self.module_pins: set[str] = set()
         for dotted, is_wildcard, alias in _extract_imports(root, source):
@@ -522,6 +527,10 @@ class _KotlinResolver:
                 # Members of an object or companion (`a.b.Obj.f`, `a.b.Obj.*`).
                 if not is_wildcard:
                     self.imported_functions[alias or segments[-1]] = self.class_pins(package, cls)
+                    if segments[-1][:1].isupper():
+                        self.nested_types[alias or segments[-1]] = dotted
+                else:
+                    self.class_wildcards.append(segments)
                 continue
             self.types[alias or cls] = (package, cls)
 
@@ -868,6 +877,7 @@ def _spring_routes(
     keys: dict[tuple[str, str], set[str]] = {}
     package = resolver.layout.package
     imported = {name: ".".join([*owner[0], owner[1]]) for name, owner in resolver.types.items()}
+    imported.update(resolver.nested_types)
 
     def walk(nodes: list[Node], classes: list[str]) -> None:
         for node in nodes:
@@ -880,7 +890,8 @@ def _spring_routes(
             interface = _child_of_type(node, "interface") is not None
             supertypes = [
                 each for written in _written_supertypes(node, source)
-                for each in spring_type_names(written, package, imported, resolver.wildcards)
+                for each in spring_type_names(written, package, imported,
+                                              [*resolver.wildcards, *resolver.class_wildcards])
             ] if SPRING_CONTROLLERS & set(mapped) and "RequestMapping" not in mapped else []
             for member in body.named_children:
                 function = member.child_by_field_name("name")
