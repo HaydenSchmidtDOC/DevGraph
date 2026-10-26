@@ -3643,7 +3643,7 @@ def logs(
             count += len(record_lines)
     for record_lines in reversed(shown):
         for line in record_lines:
-            console.print(escape(line))
+            console.print(escape(line), soft_wrap=True)  # unfolded, so `devgraph logs | grep` sees whole lines
 
 
 @app.command()
@@ -3840,10 +3840,14 @@ def export(
         None, "--output", "-o", help="File path to write to (default: stdout)."
     ),
     limit: int = typer.Option(
-        500, "--limit", "-n", help="Maximum number of nodes to export."
+        500, "--limit", "-n", help="Maximum number of nodes to export (0 for every node).", min=0
     ),
 ) -> None:
-    """Export graph data for a repository in a portable format."""
+    """Export graph data for a repository in a portable format.
+
+    Every relationship between the exported nodes is included. When the node
+    limit leaves nodes out, a notice on stderr says how many.
+    """
     if fmt not in ("json", "cypher", "dot"):
         console.print("[red][X] Error:[/red] --format must be 'json', 'cypher', or 'dot'")
         raise typer.Exit(code=1)
@@ -3865,7 +3869,7 @@ def export(
         raise typer.Exit(code=1)
 
     try:
-        nodes, edges = dashboard_queries.graph_slice(engine, repo_id, None, limit)
+        nodes, edges, total = dashboard_queries.export_slice(engine, repo_id, limit)
 
         if fmt == "json":
             result = export_json(nodes, edges)
@@ -3878,7 +3882,15 @@ def export(
             Path(output).write_text(result, encoding="utf-8")
             console.print(f"[green][OK][/green] Exported {len(nodes)} nodes, {len(edges)} edges to {escape(output)}")
         else:
-            console.print(escape(result))
+            # Written as is: the console folds long lines at its width (80
+            # columns when stdout is not a terminal), which breaks JSON strings.
+            typer.echo(result)
+        if len(nodes) < total:
+            Console(stderr=True, emoji=False).print(
+                f"[yellow]Exported {escape(str(len(nodes)))} of {escape(str(total))} nodes[/yellow] (the --limit); "
+                "use --limit 0 to export every node.",
+                soft_wrap=True,
+            )
     finally:
         engine.close()
 

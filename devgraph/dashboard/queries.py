@@ -91,6 +91,34 @@ def graph_slice(
     return node_rows, edge_rows
 
 
+def export_slice(
+    engine: GraphEngine, repo_id: str, limit: int
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+    """Nodes and edges for `devgraph export`, and the repository's node count.
+
+    At most `limit` nodes (every node when `limit` is 0), and every edge
+    between them: unlike `graph_slice`, edges are not capped at the node
+    limit, so a slice never silently loses relationships among its nodes.
+    """
+    nodes = engine.repository_nodes([repo_id])
+    total = engine.run_cypher(nodes + "RETURN count(n) AS count", {"repo_ids": [repo_id]})[0]["count"]
+    node_rows = engine.run_cypher(
+        nodes + "RETURN elementId(n) AS id, labels(n)[0] AS label, n.name AS name, n.file AS file, n.owner AS owner"
+        + (" LIMIT $limit" if limit > 0 else ""),
+        {"repo_ids": [repo_id], "limit": limit},
+    )
+    ids = [row["id"] for row in node_rows]
+    if not ids:
+        return node_rows, [], total
+    edge_rows = engine.run_cypher(
+        "UNWIND $ids AS id MATCH (a)-[r]->(b) WHERE elementId(a) = id AND b.repo_id = $repo_id "
+        "AND elementId(b) IN $ids "
+        "RETURN elementId(a) AS source, elementId(b) AS target, type(r) AS rel_type",
+        {"repo_id": repo_id, "ids": ids},
+    )
+    return node_rows, edge_rows, total
+
+
 def search_components(
     engine: GraphEngine,
     repo_id: str,
