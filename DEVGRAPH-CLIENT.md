@@ -252,8 +252,8 @@ it is on, results cover registered repositories only.
 `find_related_files` match against function/class **names** only (a file
 path like `shared/utils/x.py` returns empty; the function name defined in
 that file, e.g. `batch_retrieve_payloads`, returns real results).
-`blame_component` is the opposite — it wants a **file path**, not a function
-name. `get_source` also takes a function/class **name**. `describe_node`
+`blame_component` is the opposite — it wants a **file path** (repo-relative;
+`./src/a.py` and `src\a.py` work too), not a function name. `get_source` also takes a function/class **name**. `describe_node`
 takes a node's exact **name**; a file, folder or docs node can also be named
 by its repo-relative path, and a docs node keyed by a front-matter id by that
 id (for example `ADR-013`). Passing the wrong
