@@ -81,6 +81,8 @@ def get_git_status(repo_path: Path) -> dict[str, Any]:
             old_path = None
             if code == "??":
                 state = "untracked"
+            elif "U" in code or code in ("AA", "DD"):
+                state = "unmerged"  # a merge conflict: DD, AU, UD, UA, DU, AA, UU
             elif "R" in code or "C" in code:
                 state = "renamed" if "R" in code else "copied"
                 old_path = records[i]
