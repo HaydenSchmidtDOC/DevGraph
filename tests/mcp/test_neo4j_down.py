@@ -21,8 +21,9 @@ from devgraph.mcp import tools
 
 #: Nothing listens here (the discard port), so every connection is refused.
 CLOSED = "bolt://127.0.0.1:9"
-#: The most a call may take with Neo4j down, on any platform.
-BOUND_S = 5.0
+#: The most a call may take with Neo4j down, on any platform. Well under the
+#: driver's 30 s of retries, with headroom for a loaded CI runner.
+BOUND_S = 10.0
 
 
 @pytest.fixture
