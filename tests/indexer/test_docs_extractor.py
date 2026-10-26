@@ -26,13 +26,13 @@ Body text describing the requirement.
         assert doc.repo_id == self.repo_id
         assert doc.properties["title"] == "Users must authenticate before accessing protected endpoints"
 
-        assert len(result.relationships) == 1
-        rel = result.relationships[0]
-        assert rel.source_label == "Module"
-        assert rel.source_name == "AuthService"
-        assert rel.relationship_type == "SATISFIES"
-        assert rel.target_label == "Requirement"
-        assert rel.target_name == "req-auth-001"
+        # One edge per label a link can name (Module path, Service name).
+        assert [r.source_label for r in result.relationships] == ["Module", "Service"]
+        for rel in result.relationships:
+            assert rel.source_name == "AuthService"
+            assert rel.relationship_type == "SATISFIES"
+            assert rel.target_label == "Requirement"
+            assert rel.target_name == "req-auth-001"
 
     def test_extract_design_decision_with_supersedes_and_decided_by(self):
         content = """---
@@ -66,7 +66,7 @@ links: [CacheLayer, AuthService]
 
         assert len(result.docs) == 1
         assert result.docs[0].label == "ArchitectureNote"
-        assert len(result.relationships) == 2
+        assert len(result.relationships) == 4  # a Module and a Service edge per link
         for rel in result.relationships:
             assert rel.relationship_type == "DOCUMENTED_BY"
 

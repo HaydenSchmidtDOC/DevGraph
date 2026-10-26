@@ -439,7 +439,7 @@ The Database & memory card samples Neo4j every 15 seconds and keeps the last hou
 
 ## Optional indexing
 
-- `devgraph annotate` configures Markdown requirements, design decisions, and architecture notes.
+- `devgraph annotate` configures Markdown requirements, design decisions, and architecture notes. A note's `links:` names files by repo-relative path (`src/orders.py`) or services by name (a compose or Containerfile service, `orders-api`); a link that names nothing links nothing, silently.
 - `devgraph mentions <repo_id> enable` opts a repository into Markdown-to-entity mention indexing.
 - A changed docs path (`devgraph annotate <repo_id> --docs-path`) or mentions setting (`devgraph mentions <repo_id> enable|disable`) takes effect at the repository's next full scan, which indexes the notes and `Document`s the new settings make and removes those they no longer make (a docs path cleared with `--docs-path ""` removes every note; mentions off removes every `Document` and `MENTIONS` edge). The agent runs that scan by itself within about a minute for a watched repository (it compares the settings with the ones the last full scan recorded on the Repository node); `devgraph rescan <repo_id>` runs it now. Until then `find_mentions`, `find_requirements_for` and `trace_design_rationale` add a `notice` saying the change is not indexed yet.
 - `devgraph pr-source` and `devgraph issue-source` control the explicit opt-ins for external PR and issue ingestion.

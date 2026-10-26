@@ -6,11 +6,15 @@ single note, identified by YAML front-matter:
     ---
     type: requirement | design_decision | architecture_note
     id: unique-slug
-    links: [ModuleOrServiceName, ...]   # optional, what this note documents
+    links: [path/to/module.py, ServiceName, ...]   # optional, what this note documents
     supersedes: other-note-id           # optional, design_decision only
     ---
     # Title
     Body text...
+
+A link names a Module by its repo-relative path or a Service (a compose or
+Containerfile service) by its name; it links every node it names, and
+none when nothing has the name.
 
 Files without a `type` front-matter field are skipped (not every Markdown
 file under a docs/ folder is necessarily a DevGraph note). `id` defaults to
@@ -110,15 +114,17 @@ class DocsExtractor:
         result.docs.append(DocNode(label=label, name=note_id, repo_id=self.repo_id, properties=properties))
 
         for target in _as_list(meta.get("links")):
-            result.relationships.append(
-                Relationship(
-                    source_label="Module",
-                    source_name=str(target),
-                    relationship_type=_LINK_REL[label],
-                    target_label=label,
-                    target_name=note_id,
+            # One edge per label; only the one whose node exists is written.
+            for link_label in _LINK_LABELS:
+                result.relationships.append(
+                    Relationship(
+                        source_label=link_label,
+                        source_name=str(target),
+                        relationship_type=_LINK_REL[label],
+                        target_label=label,
+                        target_name=note_id,
+                    )
                 )
-            )
 
         supersedes = meta.get("supersedes")
         if supersedes and label == "DesignDecision":
@@ -146,6 +152,9 @@ class DocsExtractor:
 
         return result
 
+
+#: What a note's `links` can name.
+_LINK_LABELS = ("Module", "Service")
 
 # Requirement notes are SATISFIED_BY a module (Module -[:SATISFIES]-> Requirement);
 # ArchitectureNote/DesignDecision notes DOCUMENT a module (Module -[:DOCUMENTED_BY]-> note).
