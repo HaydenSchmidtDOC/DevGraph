@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 QUIET_PERIOD_S = 300.0
 CHECK_INTERVAL_S = 30.0
-#: A failing index upgrade is retried after one interval, then doubling up to this.
+#: A failing index upgrade or settings rescan is retried after one interval, then doubling up to this.
 UPGRADE_BACKOFF_MAX_S = 1800.0
 
 
@@ -124,8 +124,18 @@ class SchemaRescanScheduler:
                     self._engine, repo.repo_id, repo.docs_path, repo.mentions_enabled
                 ):
                     # `devgraph mentions` or `annotate --docs-path` changed
-                    # what a full scan indexes: apply it now, no quiet period.
-                    result = self._exclusive(repo.repo_id, lambda: self._apply_options(repo.repo_id))
+                    # what a full scan indexes: apply it now, no quiet period;
+                    # a failing rescan backs off as an upgrade does.
+                    backoff = self._upgrade_backoff.get(repo.repo_id)
+                    if backoff is not None and now < backoff[0]:
+                        continue
+                    try:
+                        result = self._exclusive(repo.repo_id, lambda: self._apply_options(repo.repo_id))
+                    except Exception:
+                        delay = min(backoff[1] * 2, UPGRADE_BACKOFF_MAX_S) if backoff else self._interval_s
+                        self._upgrade_backoff[repo.repo_id] = (now + delay, delay)
+                        raise
+                    self._upgrade_backoff.pop(repo.repo_id, None)
                     if result is None:
                         continue
                     count, _ = result
