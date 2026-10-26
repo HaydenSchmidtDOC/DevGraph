@@ -58,7 +58,7 @@ class DatastoreExtractor:
     below it, so `redistricting` is not Redis; not a relative import), a
     known client constructor on a real call (`psycopg2.connect(...)`), and a
     connection URL passed straight to a call (`create_engine("postgresql://
-    ...")`, `CLIENT_URL_SCHEMES`). A comment, a docstring or any other string
+    ...")`, `CLIENT_URL_SCHEMES`; an f-string's literal start). A comment, a docstring or any other string
     names none, nor does a file under a test folder (`TEST_DIR`)."""
 
     #: (type, provider, library) of each client module, by its name.
@@ -192,15 +192,18 @@ def _imported_modules(node: Node) -> list[str]:
 
 
 def _string_value(node: Node | None) -> str | None:
-    """A plain string literal's value (no f-string substitution, not
-    implicitly concatenated); None for anything else."""
+    """A string literal's value up to its first substitution (an f-string's
+    literal start, `f"postgresql://{host}/db"` gives `postgresql://`); None
+    for anything else (an implicit concatenation too)."""
     if node is None or node.type != "string":
         return None
-    if any(child.type == "interpolation" for child in node.named_children):
-        return None
-    return "".join(
-        child.text.decode("utf-8", errors="replace") for child in node.named_children if child.type == "string_content"
-    )
+    parts: list[str] = []
+    for child in node.named_children:
+        if child.type == "interpolation":
+            break
+        if child.type == "string_content":
+            parts.append(child.text.decode("utf-8", errors="replace"))
+    return "".join(parts)
 
 
 # --- Other languages' clients ------------------------------------------------
@@ -340,7 +343,8 @@ _GO_IMPORT_LINE = re.compile(r"^import\s+(?:[\w.]+\s+)?" + _STRING, re.M)
 _GO_IMPORT_SPEC = re.compile(r"^\s*(?:[\w.]+\s+)?" + _STRING, re.M)
 #: A string passed straight to a call: its literal follows `(` or `,`.
 _CALL_ARGUMENT = re.compile(r"[(,]\s*" + _STRING)
-_URL_SCHEME = re.compile(r"(postgres(?:ql)?|mysql|mongodb(?:\+srv)?|rediss?|amqps?)://")
+#: A SQLAlchemy `dialect+driver` URL (`postgresql+asyncpg://`) names its dialect's store.
+_URL_SCHEME = re.compile(r"(postgres(?:ql)?|mysql|mongodb(?:\+srv)?|rediss?|amqps?)(?:\+\w+)?://")
 _JDBC_URL = re.compile(r"jdbc:(\w+):")
 
 

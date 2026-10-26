@@ -91,3 +91,27 @@ def test_one_node_per_provider():
     source = "import psycopg2\nimport psycopg\npsycopg.connect('postgresql://x')\n"
     result = DatastoreExtractor("repo").extract_from_source(source, "shop/db.py")
     assert [(ds.provider, ds.properties["library"]) for ds in result.datastores] == [("PostgreSQL", "psycopg")]
+
+
+def test_an_f_string_url_counts_by_its_literal_start():
+    source = '''
+        engine = create_engine(f"postgresql://{user}@{host}/db")
+        other = connect(f"{scheme}://{host}")
+    '''
+    assert providers(source) == ["PostgreSQL"]
+
+
+def test_a_sqlalchemy_dialect_driver_url_names_its_store():
+    source = '''
+        a = create_engine("mysql+pymysql://shop@db/orders")
+        b = create_engine("postgresql+asyncpg://shop@db/orders")
+        c = MongoClient("mongodb+srv://cluster/x")
+    '''
+    assert providers(source) == ["MongoDB", "MySQL", "PostgreSQL"]
+
+
+def test_a_dialect_driver_url_in_another_language():
+    from devgraph.indexer.datastores.extractor import client_datastores
+
+    source = "const db = connect('postgresql+psycopg2://shop@db/orders');\n"
+    assert [ds.provider for ds in client_datastores(source, "js", "repo", "src/db.js")] == ["PostgreSQL"]

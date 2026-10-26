@@ -1267,8 +1267,10 @@ module itself or one below it, `redis.asyncio`; never a relative import;
 `pymysql` for MySQL), a known client call on a real call node
 (`CLIENT_CALLS`: `psycopg2.connect(...)`, `redis.Redis(...)`), and a
 connection URL that is a call's argument, positional or keyword
-(`create_engine("postgresql://...")`, the schemes above); an f-string or a
-concatenation is not read. A file under a test folder (`TEST_DIR`) names
+(`create_engine("postgresql://...")`, the schemes above, and for every
+language SQLAlchemy's `dialect+driver` form, `postgresql+asyncpg://`); an
+f-string counts by its literal start (`f"postgresql://{host}/db"`), an
+implicit concatenation not at all. A file under a test folder (`TEST_DIR`) names
 none, and its node per provider takes the alphabetically first library, as
 the other languages' do. Both dispatcher call sites (`_datastore_nodes`,
 `_owning_service_relationships`) go through it.

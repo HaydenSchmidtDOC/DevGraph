@@ -219,9 +219,11 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: an unnamed object literal's method)
 #: attributed to the named function holding it (jsts `_call_functions`);
 #: and Python datastores read from the syntax tree (an import of a client
-#: module or one below it, a known client call, a URL passed to a call; no
+#: module or one below it, a known client call, a URL passed to a call, an
+#: f-string's by its literal start; no
 #: comment, docstring or other string, no test folder, one node per
-#: provider; datastores/extractor.py `DatastoreExtractor`).
+#: provider; datastores/extractor.py `DatastoreExtractor`), and a
+#: `dialect+driver` connection URL (`postgresql+asyncpg://`) in every language.
 #: An index stamped lower, or not at all, is rescanned automatically.
 INDEX_FORMAT = 20
 
