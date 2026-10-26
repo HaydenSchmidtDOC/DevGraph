@@ -51,3 +51,29 @@ def test_a_module_function_used_in_the_factory_and_a_nested_scope():
         ("GET /health", "health", "", None), ("GET /health", "health", "shop/app.py", ""),
         ("GET /status", "status", "", None), ("GET /status", "status", "shop/app.py", "create_app.register"),
     ]
+
+
+def test_a_method_body_does_not_see_its_class_scope():
+    # Python resolves a bare name in a method past its class body: `index`
+    # in `go` is the module's function, not the method `Setup.index`. A call
+    # directly in the class body does see the class's own names.
+    assert _targets("""\
+        from flask import Flask
+
+        app = Flask(__name__)
+
+        def index():
+            return "home"
+
+        class Setup:
+            def index(self):
+                return "method"
+
+            def go(self):
+                app.add_url_rule("/c", view_func=index)
+
+            app.add_url_rule("/d", view_func=index)
+    """) == [
+        ("GET /c", "index", "", None), ("GET /c", "index", "shop/app.py", ""),
+        ("GET /d", "index", "", None), ("GET /d", "index", "shop/app.py", "Setup"),
+    ]

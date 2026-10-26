@@ -203,6 +203,7 @@ class _Routes:
         self.local: dict[str, list[tuple[str, str, str | None]]] = {}  # router -> its (mounted on, framework, prefix)
         self.classes: set[str] = set()  # the file's top-level classes
         self.functions: set[tuple[str, str]] = set()  # the file's functions: (name, owner)
+        self.class_scopes: set[str] = set()  # the owner each class's members have (`Outer.Inner`)
         # Iterative, in source order: a deeply nested expression (3,000 `+`
         # terms) is read on any thread's stack.
         pending: list[tuple[Node, str, str | None, str]] = [(root, "Module", None, "")]
@@ -259,8 +260,10 @@ class _Routes:
                         self.decorated.append((target, _text(handler, source), member_owner(label, name, owner)))
         if node.type in ("class_definition", "function_definition"):
             name_node = node.child_by_field_name("name")
-            if name_node is not None and node.type == "class_definition" and label == "Module":
-                self.classes.add(_text(name_node, source))
+            if name_node is not None and node.type == "class_definition":
+                self.class_scopes.add(member_owner("Class", _text(name_node, source), member_owner(label, name, owner)))
+                if label == "Module":
+                    self.classes.add(_text(name_node, source))
             elif name_node is not None and node.type == "function_definition":
                 self.functions.add((_text(name_node, source), member_owner(label, name, owner)))
             if name_node is not None:
@@ -548,7 +551,8 @@ def _rule_views(
     an `add_url_rule`/`add_api_route` view (`_Routes.rule_calls`).
 
     A function of the file the call's scope sees (one defined beside the
-    call, an app factory's nested `index`, else in a scope around it) is
+    call, an app factory's nested `index`, else in a function around it or
+    at the top level, never in a class body around it, as Python sees it) is
     that file's of its owner, as a decorated handler is; any
     other name links where `_django_implements` finds it (its imported
     module's). A class-based view's `as_view(...)` (Flask's `MethodView`)
@@ -568,7 +572,10 @@ def _rule_views(
     if view.type not in ("identifier", "attribute"):
         return []
     written = _text(view, source)
-    scopes = [scope.rsplit(".", depth)[0] for depth in range(scope.count(".") + 1)] + [""] if scope else [""]
+    # The call's own scope, then the functions around it: a class body around
+    # a function is no scope of it (a method's bare `index` is the module's).
+    enclosing = [scope.rsplit(".", depth)[0] for depth in range(1, scope.count(".") + 1)]
+    scopes = ([scope] if scope else []) + [each for each in enclosing if each not in routes.class_scopes] + [""]
     owner = next((each for each in scopes if (written, each) in routes.functions), None)
     if not class_view and view.type == "identifier" and owner is not None:
         return [
