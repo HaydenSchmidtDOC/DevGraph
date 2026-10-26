@@ -1007,6 +1007,9 @@ class _StubEngine:
     def upsert_repository(self, repo_id, name, path):
         self.calls.append("upsert_repository")
 
+    def repo_node_counts(self, repo_ids):
+        return {}
+
     def full_scan_holder(self, repo_id, stale_s):
         return None
 
@@ -2367,6 +2370,9 @@ def _orphan_engine(graph_ids, deleted):
         def graph_repo_ids(self):
             return set(graph_ids)
 
+        def repo_node_counts(self, repo_ids):
+            return {}
+
         def delete_repository(self, repo_id):
             deleted.append(repo_id)
 
@@ -2406,6 +2412,6 @@ def test_cli_prune_deletes_nodes_left_without_a_repository_node(runner, temp_reg
          patch.object(cli_main, "GraphEngine", engine_cls):
         dry = runner.invoke(app, ["prune", "--dry-run"])
         assert "gone-repo" in dry.stdout and deleted == []
-        result = runner.invoke(app, ["prune"])
+        result = runner.invoke(app, ["prune", "--yes"])
     assert result.exit_code == 0, result.stdout
     assert deleted == ["gone-repo"]

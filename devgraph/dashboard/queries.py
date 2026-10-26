@@ -125,18 +125,23 @@ def search_components(
     ]
 
 
-def total_counts(engine: GraphEngine) -> dict[str, Any]:
-    """Aggregate node and relationship counts across all repos.
+def total_counts(engine: GraphEngine, repo_ids: list[str]) -> dict[str, Any]:
+    """Aggregate node and relationship counts across `repo_ids` (the
+    registered repositories): the same shape as summary_counts, summed.
 
-    Returns the same shape as summary_counts but without a repo_id filter.
+    Graph data of ids the registry doesn't hold (a removal that kept its data,
+    another DevGraph registry on the same Neo4j) is not counted.
     """
+    nodes = engine.repository_nodes(repo_ids)
     node_rows = engine.run_cypher(
-        "MATCH (n) UNWIND labels(n) AS label "
-        "RETURN label, count(*) AS count ORDER BY label"
+        nodes + "UNWIND labels(n) AS label "
+        "RETURN label, count(*) AS count ORDER BY label",
+        {"repo_ids": repo_ids},
     )
     rel_rows = engine.run_cypher(
-        "MATCH (a)-[r]->(b) "
-        "RETURN type(r) AS type, count(*) AS count ORDER BY type"
+        nodes + "MATCH (n)-[r]->(b) WHERE b.repo_id = n.repo_id "
+        "RETURN type(r) AS type, count(*) AS count ORDER BY type",
+        {"repo_ids": repo_ids},
     )
     return {
         "nodes_by_label": {row["label"]: row["count"] for row in node_rows},

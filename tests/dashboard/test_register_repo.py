@@ -47,6 +47,9 @@ class StubEngine:
         self.effective_schemas.append(effective)
         self._record(("init_schema",))
 
+    def repo_node_counts(self, repo_ids) -> dict[str, int]:
+        return {}  # no earlier repository left graph data under the new id
+
     def upsert_repository(self, repo_id: str, name: str, path: str) -> None:
         self._record(("upsert_repository", repo_id, name, path))
 

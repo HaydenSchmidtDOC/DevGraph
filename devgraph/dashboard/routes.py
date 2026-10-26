@@ -61,7 +61,13 @@ from devgraph.dashboard.events import CLOSED, EventBroadcaster
 from devgraph.dashboard.git_info import get_git_log, get_git_status
 from devgraph.dashboard.layout_store import load_layout, save_layout
 from devgraph.dashboard.query_log import QueryLog
-from devgraph.graph.engine import EngineClosed, GraphEngine, identity_key, provision_repository_schema
+from devgraph.graph.engine import (
+    EngineClosed,
+    GraphEngine,
+    clear_leftover_graph_data,
+    identity_key,
+    provision_repository_schema,
+)
 from devgraph.graph.schema import (
     BUILTIN_LABELS,
     INTERNAL_EDGE_PROPERTIES,
@@ -409,6 +415,8 @@ def build_router(
         warning: str | None = None
         try:
             provision_repository_schema(engine, record.path)
+            if clear_leftover_graph_data(engine, record.repo_id):
+                logger.info("deleted graph data an earlier repository left under %s", record.repo_id)
             engine.upsert_repository(record.repo_id, record.repo_id, str(record.path))
 
             def scan_and_stamp() -> int:

@@ -2777,6 +2777,16 @@ class GraphEngine:
             )
             return {record["repo_id"] for record in result or []}
 
+    def repo_node_counts(self, repo_ids: Iterable[str]) -> dict[str, int]:
+        """How many nodes carry each of these repo_ids; an id no node carries is left out."""
+        with self._driver.session() as session:
+            result = _run_records(
+                session,
+                "MATCH (n) WHERE n.repo_id IN $repo_ids RETURN n.repo_id AS repo_id, count(*) AS count",
+                repo_ids=list(repo_ids),
+            )
+            return {record["repo_id"]: record["count"] for record in result or []}
+
     def delete_repository(self, repo_id: str) -> None:
         """Remove every node (and its relationships) scoped to this repo_id."""
         with self._driver.session() as session:
@@ -2994,6 +3004,25 @@ def _graph_shaped(result: Any, max_rows: int | None = None) -> dict[str, Any]:
             }
         )
     return {"columns": columns, "data": data, "truncated": truncated}
+
+
+def clear_leftover_graph_data(engine: GraphEngine, repo_id: str) -> bool:
+    """Delete the graph data a repo id the registry has just issued already has.
+
+    Registration checks only the registry, so an id whose earlier repository
+    was unregistered with its data kept (`remove --keep-graph`, a lost or
+    reset registry) would otherwise hand that repository's nodes (its commits,
+    say) to the new one, where the initial scan never removes them and
+    `devgraph prune` no longer sees them. The registry owns nothing under the
+    id yet, so everything there is a leftover. Run after provisioning, so its
+    labels' constraints are not released here: one no repository declares any
+    more is reported by `devgraph doctor` and dropped by
+    `devgraph config schema prune-constraints`. True when anything was deleted.
+    """
+    if not engine.repo_node_counts([repo_id]):
+        return False
+    engine.delete_repository(repo_id)
+    return True
 
 
 def provision_repository_schema(engine: GraphEngine, repo_root: Path | str) -> None:

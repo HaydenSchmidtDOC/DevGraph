@@ -34,7 +34,7 @@ from devgraph.config.edits import removed_types as _removed_types  # noqa: F401 
 from devgraph.config.schema_findings import project_schema_findings as _project_schema_findings
 from devgraph.dashboard import queries as dashboard_queries
 from devgraph.dashboard.url import dashboard_url, probe_dashboard
-from devgraph.graph.engine import GraphEngine, provision_repository_schema
+from devgraph.graph.engine import GraphEngine, clear_leftover_graph_data, provision_repository_schema
 from devgraph.indexer.dispatch import full_scan, full_scan_elsewhere
 from devgraph.indexer.docs.extractor import index_file as index_doc_file
 from devgraph.indexer.git_history.extractor import sync_git_history
@@ -136,6 +136,12 @@ def add(
                 engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
                 try:
                     provision_repository_schema(engine, record.path)
+                    if clear_leftover_graph_data(engine, record.repo_id):
+                        console.print(
+                            f"[yellow]Deleted graph data an earlier repository left under {escape(record.repo_id)}[/yellow] "
+                            "(unregistered with its graph data kept)",
+                            soft_wrap=True,
+                        )
                     engine.upsert_repository(record.repo_id, record.repo_id, str(record.path))
                     started = datetime.now(timezone.utc)
                     skipped: dict[str, str] = {}
@@ -2098,7 +2104,7 @@ def dashboard(
 @app.command()
 def stats(
     repo_id: Optional[str] = typer.Argument(
-        None, help="Repository ID. Omit for aggregate stats across all repos."
+        None, help="Repository ID. Omit for aggregate stats across all registered repos."
     ),
     as_json: bool = typer.Option(
         False, "--json", help="Output as JSON instead of a table."
@@ -2127,7 +2133,12 @@ def stats(
             total_nodes = sum(data["nodes_by_label"].values())
             total_rels = sum(data["relationships_by_type"].values())
         else:
-            data = dashboard_queries.total_counts(engine)
+            registry = _get_registry()
+            try:
+                registered_ids = [r.repo_id for r in registry.list_repos()]
+            finally:
+                registry.close()
+            data = dashboard_queries.total_counts(engine, registered_ids)
             total_nodes = sum(data["nodes_by_label"].values())
             total_rels = sum(data["relationships_by_type"].values())
 
@@ -3640,8 +3651,14 @@ def prune(
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Show what would be deleted without actually deleting."
     ),
+    yes: bool = typer.Option(False, "--yes", help="Delete without asking for confirmation."),
 ) -> None:
-    """Remove orphaned graph data for repos no longer in the registry."""
+    """Delete the graph data of every repo id this registry doesn't hold.
+
+    That includes the repositories of any other DevGraph registry sharing the
+    same Neo4j: the ids are listed first, and deleting needs a confirmation at
+    a terminal or --yes.
+    """
     settings = get_settings()
     registry = _get_registry()
     try:
@@ -3665,13 +3682,30 @@ def prune(
             console.print("[green]No orphaned repos found.[/green]")
             return
 
-        console.print(f"Found {len(orphaned)} orphaned repo(s):")
+        counts = engine.repo_node_counts(orphaned)
+        console.print(f"Found {len(orphaned)} repo id(s) in Neo4j that this registry doesn't hold:")
         for rid in sorted(orphaned):
-            console.print(f"  {escape(str(rid))}")
+            console.print(f"  {escape(str(rid))} ({counts.get(rid, 0)} node(s))", soft_wrap=True)
+        console.print(
+            "[yellow]If another DevGraph install (another user, WSL, a container deployment, a test run) "
+            "uses this Neo4j, these may be its repositories: deleting them deletes its data.[/yellow]",
+            soft_wrap=True,
+        )
 
         if dry_run:
             console.print("[yellow]Dry run — no data deleted.[/yellow]")
             return
+        if not yes:
+            if not _stdin_is_tty():
+                console.print(
+                    "[red][X] Not deleted:[/red] no terminal to confirm on; review the list above, "
+                    "then run 'devgraph prune --yes'.",
+                    soft_wrap=True,
+                )
+                raise typer.Exit(code=1)
+            if not typer.confirm(f"Delete the graph data of these {len(orphaned)} repo id(s)?", default=False):
+                console.print("Nothing deleted.")
+                raise typer.Exit(code=1)
 
         for rid in sorted(orphaned):
             recorded = engine.read_applied_schema(rid) or {}
