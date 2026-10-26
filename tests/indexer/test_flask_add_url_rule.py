@@ -46,7 +46,9 @@ def test_a_function_view_is_a_get_route_of_the_file():
     assert {e.properties["framework"] for e in result.endpoints} == {"Flask"}
 
 
-def test_a_method_view_of_the_file_is_one_route_per_http_method_it_defines():
+def test_a_method_view_without_methods_is_one_route_of_every_method():
+    # As a Django class-based view: one `*` route, its class's every HTTP
+    # method handler linked, wherever the class is defined.
     result = _extract("""\
         from flask import Flask
         from flask.views import MethodView
@@ -64,19 +66,15 @@ def test_a_method_view_of_the_file_is_one_route_per_http_method_it_defines():
             def post(self, id):
                 pass
 
-            def helper(self):
-                pass
-
         app.add_url_rule("/users/<int:id>", view_func=UserAPI.as_view("user_api"))
     """)
-    assert _endpoints(result) == ["DELETE /users/<int:id>", "GET /users/<int:id>", "POST /users/<int:id>"]
-    for method in ("get", "post", "delete"):
-        endpoint = f"{method.upper()} /users/<int:id>"
-        assert sorted(t for t in _targets(result) if t[0] == endpoint) == [
-            (endpoint, "Class", "UserAPI", "shop/app.py", ""),
-            (endpoint, "Function", "UserAPI", "", None),
-            (endpoint, "Function", method, "shop/app.py", "UserAPI"),
-        ]
+    assert _endpoints(result) == ["* /users/<int:id>"]
+    http = ("delete", "get", "head", "options", "patch", "post", "put", "trace")
+    assert _targets(result) == sorted([
+        ("* /users/<int:id>", "Class", "UserAPI", "shop/app.py", ""),
+        ("* /users/<int:id>", "Function", "UserAPI", "", None),
+        *(("* /users/<int:id>", "Function", method, "shop/app.py", "UserAPI") for method in http),
+    ])
 
 
 def test_a_method_view_with_methods_given_is_those_methods():

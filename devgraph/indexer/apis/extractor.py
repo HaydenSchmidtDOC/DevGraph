@@ -115,8 +115,6 @@ _MOUNT_CALLS = {"include_router": ("FastAPI", "prefix"), "register_blueprint": (
 _RULE_CALLS = {
     "add_url_rule": ("Flask", "rule", "view_func", 2), "add_api_route": ("FastAPI", "path", "endpoint", 1),
 }
-#: A Flask class-based view's bases that give it no HTTP method handler.
-_VIEW_BASES = frozenset({"MethodView", "View", "object"})
 #: The suffix of a Flask blueprint's export name for a mount that replaces
 #: its own `url_prefix` (`register_blueprint(bp, url_prefix=...)`): Flask
 #: puts the blueprint's routes under that prefix instead of its own, where
@@ -205,8 +203,6 @@ class _Routes:
         self.local: dict[str, list[tuple[str, str, str | None]]] = {}  # router -> its (mounted on, framework, prefix)
         self.classes: set[str] = set()  # the file's top-level classes
         self.functions: set[tuple[str, str]] = set()  # the file's functions: (name, owner)
-        self.class_methods: dict[str, set[str]] = {}  # top-level class -> the methods it defines
-        self.class_bases: dict[str, list[str]] = {}  # top-level class -> its bases as written
         # Iterative, in source order: a deeply nested expression (3,000 `+`
         # terms) is read on any thread's stack.
         pending: list[tuple[Node, str, str | None, str]] = [(root, "Module", None, "")]
@@ -265,15 +261,8 @@ class _Routes:
             name_node = node.child_by_field_name("name")
             if name_node is not None and node.type == "class_definition" and label == "Module":
                 self.classes.add(_text(name_node, source))
-                bases = node.child_by_field_name("superclasses")
-                self.class_bases[_text(name_node, source)] = [
-                    _text(base, source) for base in (bases.named_children if bases is not None else [])
-                    if base.type in ("identifier", "attribute")
-                ]
             elif name_node is not None and node.type == "function_definition":
                 self.functions.add((_text(name_node, source), member_owner(label, name, owner)))
-                if label == "Class" and not owner and name in self.classes:
-                    self.class_methods.setdefault(name, set()).add(_text(name_node, source))
             if name_node is not None:
                 owner = member_owner(label, name, owner)
                 label = "Class" if node.type == "class_definition" else "Function"
@@ -348,24 +337,6 @@ class _Routes:
                 framework, None if given is None else _methods(given, self.source), path, view, receiver, scope,
             ))
         return found
-
-    def view_methods(self, cls: str, seen: frozenset = frozenset()) -> tuple[str, ...] | None:
-        """The HTTP method handlers (`get`, `post`, ...) a top-level class
-        of the file defines or inherits from classes of the file, as a
-        Flask `MethodView` routes them; None when it is no class of the
-        file or a base of it is another file's (its methods are not known
-        here)."""
-        if cls not in self.classes or cls in seen:
-            return None
-        found = self.class_methods.get(cls, set()) & set(_HTTP_METHOD_HANDLERS)
-        for base in self.class_bases.get(cls, ()):
-            if base.rsplit(".", 1)[-1] in _VIEW_BASES:
-                continue
-            inherited = self.view_methods(base, seen | {cls})
-            if inherited is None:
-                return None
-            found |= set(inherited)
-        return tuple(method for method in _HTTP_METHOD_HANDLERS if method in found)
 
     def mount_calls(self) -> list[tuple[str, str, str | None, Node]]:
         """(framework, the app or router mounted on, the prefix, the router
@@ -581,21 +552,18 @@ def _rule_views(
     that file's of its owner, as a decorated handler is; any
     other name links where `_django_implements` finds it (its imported
     module's). A class-based view's `as_view(...)` (Flask's `MethodView`)
-    is its Class and, per method, the method's handler (`get` for GET);
-    with no `methods=` its methods are the HTTP method handlers the class
-    has (`_Routes.view_methods`), or for a class whose methods aren't
-    known here (another file's) one "*" route linking every HTTP method
-    handler of it, as a Django class-based view's does. Any other view
-    (a lambda) is no route."""
+    is its Class and, per route, its handlers: with no `methods=` one "*"
+    route linking every HTTP method handler of the class, as a Django
+    class-based view's does, wherever the class is; with `methods=` one
+    route per method, linking the method's handler (`get` for GET). Any
+    other view (a lambda) is no route."""
     class_view = False
     if view.type == "call":  # `UserAPI.as_view("user_api")`
         inner = view.child_by_field_name("function")
         view = inner.child_by_field_name("object") if inner is not None and inner.type == "attribute" else None
         if view is None or not _text(inner, source).endswith(".as_view"):
             return []
-        if methods is None:
-            known = routes.view_methods(_text(view, source))
-            methods = [method.upper() for method in known] if known else ["*"]
+        methods = methods or ["*"]
         class_view = True
     if view.type not in ("identifier", "attribute"):
         return []
