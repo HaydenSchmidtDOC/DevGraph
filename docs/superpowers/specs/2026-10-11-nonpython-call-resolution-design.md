@@ -1252,6 +1252,26 @@ toggles clients' imports in Python, TS, Java, Kotlin, C# and Go files
 (`op_datastore`); `tests/indexer/test_client_datastores_live.py` scans one
 service per language. C++ and Rust clients are not read.
 
+**Python from the syntax tree** (index format 20, audit 8 item 3). The
+Python `DatastoreExtractor` was a regular expression over the whole file:
+`import\s+(\S+)` matched by prefix (`redistricting` was Redis), and
+`postgresql://`, `pymysql`, `MongoClient(` and the like anywhere in the
+text, a comment, a docstring or the extractor's own tables, made a store,
+and a test folder was not skipped (DevGraph's own repository had 13
+stores, two real). It now walks the Tree-sitter Python tree: an
+`import`/`from ... import` of a client module (`DATASTORE_LIBRARY_MAP`: the
+module itself or one below it, `redis.asyncio`; never a relative import;
+`pymysql` for MySQL), a known client call on a real call node
+(`CLIENT_CALLS`: `psycopg2.connect(...)`, `redis.Redis(...)`), and a
+connection URL that is a call's argument, positional or keyword
+(`create_engine("postgresql://...")`, the schemes above); an f-string or a
+concatenation is not read. A file under a test folder (`TEST_DIR`) names
+none, and its node per provider takes the alphabetically first library, as
+the other languages' do. Both dispatcher call sites (`_datastore_nodes`,
+`_owning_service_relationships`) go through it.
+`tests/indexer/test_python_datastores_syntax.py` and
+`test_python_datastores_live.py`.
+
 ## Express routers mounted from another file (index format 18)
 
 `app.use('/api', usersRouter)`, with `usersRouter` imported from

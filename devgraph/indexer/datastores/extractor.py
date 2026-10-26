@@ -5,6 +5,9 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Set
 
+import tree_sitter_python as tspython
+from tree_sitter import Language, Node, Parser
+
 from devgraph.test_paths import TEST_DIR
 
 
@@ -49,38 +52,49 @@ class ExtractionResult:
 
 
 class DatastoreExtractor:
-    """Detects datastore client usage and imports in Python source code."""
+    """Detects datastore client usage and imports in Python source code,
+    read from its syntax tree: an import of a client module (`import
+    redis`, `from redis.asyncio import Redis`; the module itself or one
+    below it, so `redistricting` is not Redis; not a relative import), a
+    known client constructor on a real call (`psycopg2.connect(...)`), and a
+    connection URL passed straight to a call (`create_engine("postgresql://
+    ...")`, `CLIENT_URL_SCHEMES`). A comment, a docstring or any other string
+    names none, nor does a file under a test folder (`TEST_DIR`)."""
 
-    # Mapping of package imports to datastore info
+    #: (type, provider, library) of each client module, by its name.
     DATASTORE_LIBRARY_MAP = {
-        # PostgreSQL
-        r"psycopg2": ("Database", "PostgreSQL", "psycopg2"),
-        r"psycopg": ("Database", "PostgreSQL", "psycopg"),
-        # Redis
-        r"redis": ("Cache", "Redis", "redis-py"),
-        # Neo4j
-        r"neo4j": ("Database", "Neo4j", "neo4j-python-driver"),
-        # Qdrant
-        r"qdrant_client": ("VectorStore", "Qdrant", "qdrant-client"),
-        # Kafka
-        r"kafka": ("Queue", "Kafka", "kafka-python"),
-        # RabbitMQ
-        r"pika": ("Queue", "RabbitMQ", "pika"),
-        r"kombu": ("Queue", "RabbitMQ", "kombu"),
-        # MongoDB
-        r"pymongo": ("Database", "MongoDB", "pymongo"),
-        # DuckDB
-        r"duckdb": ("Database", "DuckDB", "duckdb"),
-        # SQLite (stdlib, but if imported explicitly)
-        r"sqlite3": ("Database", "SQLite", "sqlite3"),
+        "psycopg2": ("Database", "PostgreSQL", "psycopg2"),
+        "psycopg": ("Database", "PostgreSQL", "psycopg"),
+        "pymysql": ("Database", "MySQL", "pymysql"),
+        "redis": ("Cache", "Redis", "redis-py"),
+        "neo4j": ("Database", "Neo4j", "neo4j-python-driver"),
+        "qdrant_client": ("VectorStore", "Qdrant", "qdrant-client"),
+        "kafka": ("Queue", "Kafka", "kafka-python"),
+        "pika": ("Queue", "RabbitMQ", "pika"),
+        "kombu": ("Queue", "RabbitMQ", "kombu"),
+        "pymongo": ("Database", "MongoDB", "pymongo"),
+        "duckdb": ("Database", "DuckDB", "duckdb"),
+        "sqlite3": ("Database", "SQLite", "sqlite3"),
         # Valkey (Redis compatible)
-        r"valkey": ("Cache", "Valkey", "valkey"),
-        # Weaviate
-        r"weaviate": ("VectorStore", "Weaviate", "weaviate-client"),
-        # Pinecone
-        r"pinecone": ("VectorStore", "Pinecone", "pinecone-client"),
-        # LangChain integrations (various datastores)
-        r"langchain.*vector": ("VectorStore", "LangChain", "langchain"),
+        "valkey": ("Cache", "Valkey", "valkey"),
+        "weaviate": ("VectorStore", "Weaviate", "weaviate-client"),
+        "pinecone": ("VectorStore", "Pinecone", "pinecone-client"),
+    }
+    #: A LangChain module with a vector store (`langchain_community.vectorstores`).
+    LANGCHAIN_VECTOR = re.compile(r"langchain.*vector")
+    #: The client constructors and connect calls that name their store
+    #: without an import of the file's own (`psycopg2.connect(dsn)`), by the
+    #: called name's module.
+    CLIENT_CALLS = {
+        "psycopg2.connect": "psycopg2", "psycopg.connect": "psycopg", "pymysql.connect": "pymysql",
+        "redis.Redis": "redis", "redis.StrictRedis": "redis", "redis.ConnectionPool": "redis",
+        "neo4j.GraphDatabase.driver": "neo4j", "qdrant_client.QdrantClient": "qdrant_client",
+        "kafka.KafkaProducer": "kafka", "kafka.KafkaConsumer": "kafka",
+        "pika.BlockingConnection": "pika", "pika.ConnectionParameters": "pika",
+        "kombu.Connection": "kombu", "kombu.Queue": "kombu", "pymongo.MongoClient": "pymongo",
+        "duckdb.connect": "duckdb", "duckdb.sql": "duckdb", "weaviate.Client": "weaviate",
+        "pinecone.Index": "pinecone", "pinecone.init": "pinecone",
+        "sqlite3.connect": "sqlite3", "sqlite3.Connection": "sqlite3",
     }
 
     def __init__(self, repo_id: str):
@@ -92,127 +106,101 @@ class DatastoreExtractor:
         self.repo_id = repo_id
 
     def extract_from_source(self, content: str, filename: str = "unknown.py") -> ExtractionResult:
-        """Extract datastore usage from Python source code.
+        """Extract datastore usage from Python source code, one node per
+        provider; its `library` is the alphabetically first of the file's
+        clients of that provider, as `client_datastores`'s is.
 
         Args:
             content: The Python source code content.
-            filename: The source filename for context.
+            filename: The source file's repository-relative path.
 
         Returns:
             ExtractionResult containing extracted Datastore nodes.
         """
         result = ExtractionResult()
-        detected_datastores: Set[tuple] = set()  # (provider, type, library)
+        if TEST_DIR.search(filename):
+            return result
+        found: Set[tuple] = set()  # (type, provider, library)
+        root = Parser(_PY_LANGUAGE).parse(content.encode("utf-8")).root_node
+        pending = [root]
+        while pending:
+            node = pending.pop()
+            pending += node.named_children
+            if node.type in ("import_statement", "import_from_statement"):
+                for module in _imported_modules(node):
+                    client = self._module_client(module)
+                    if client is not None:
+                        found.add(client)
+            elif node.type == "call":
+                self._call_clients(node, found)
 
-        # Extract from import statements
-        self._extract_from_imports(content, detected_datastores)
-
-        # Extract from connection string patterns and client instantiations
-        self._extract_from_usage(content, detected_datastores)
-
-        # Convert detected datastores to nodes. Sorted, not set order: two
-        # libraries for the same provider in one file (e.g. psycopg2 and
-        # psycopg) MERGE into one node, and the last one written wins its
-        # `library` property.
-        for provider, ds_type, library in sorted(detected_datastores):
-            datastore = DatastoreNode(
-                name=provider,
-                datastore_type=ds_type,
-                provider=provider,
-                repo_id=self.repo_id,
-                properties={"library": library, "source": filename},
+        by_provider: dict[tuple[str, str], str] = {}
+        for ds_type, provider, library in sorted(found):
+            by_provider.setdefault((ds_type, provider), library)
+        for (ds_type, provider), library in sorted(by_provider.items(), key=lambda item: item[0][1]):
+            result.datastores.append(
+                DatastoreNode(
+                    name=provider,
+                    datastore_type=ds_type,
+                    provider=provider,
+                    repo_id=self.repo_id,
+                    properties={"library": library, "source": filename},
+                )
             )
-            result.datastores.append(datastore)
-
         return result
 
-    def _extract_from_imports(
-        self, content: str, detected_datastores: Set[tuple]
-    ) -> None:
-        """Extract datastore information from import statements."""
-        # Pattern for: import <module> or from <module> import <name>
-        import_pattern = r"(?:from\s+(\S+)\s+)?import\s+(\S+)"
+    def _module_client(self, module: str) -> tuple[str, str, str] | None:
+        """The client a module is or is below (`redis.asyncio` is redis's)."""
+        client = self.DATASTORE_LIBRARY_MAP.get(module.split(".")[0])
+        if client is None and self.LANGCHAIN_VECTOR.match(module):
+            client = ("VectorStore", "LangChain", "langchain")
+        return client
 
-        for match in re.finditer(import_pattern, content):
-            module = match.group(1) or match.group(2)
-            # Extract the top-level module name
-            module_name = module.split(".")[0]
+    def _call_clients(self, call: Node, found: Set[tuple]) -> None:
+        """A known client call's store, and a connection URL's passed straight to it."""
+        function = call.child_by_field_name("function")
+        module = self.CLIENT_CALLS.get(function.text.decode("utf-8", errors="replace")) if function else None
+        if module is not None:
+            found.add(self.DATASTORE_LIBRARY_MAP[module])
+        arguments = call.child_by_field_name("arguments")
+        if arguments is None or arguments.type != "argument_list":
+            return
+        for argument in arguments.named_children:
+            if argument.type == "keyword_argument":
+                argument = argument.child_by_field_name("value")
+            value = _string_value(argument)
+            if value is not None and (url := _URL_SCHEME.match(value)) is not None:
+                found.add((*CLIENT_URL_SCHEMES[url.group(1)], "url"))
 
-            for lib_pattern, (ds_type, provider, library) in self.DATASTORE_LIBRARY_MAP.items():
-                if re.match(lib_pattern, module_name):
-                    detected_datastores.add((provider, ds_type, library))
 
-    def _extract_from_usage(
-        self, content: str, detected_datastores: Set[tuple]
-    ) -> None:
-        """Extract datastore usage from client instantiation and connection patterns."""
-        # PostgreSQL connection strings
-        if re.search(
-            r"(psycopg2|psycopg)\.connect|postgresql://", content, re.IGNORECASE
-        ):
-            detected_datastores.add(("PostgreSQL", "Database", "psycopg2"))
+_PY_LANGUAGE = Language(tspython.language())
 
-        # MySQL connection strings
-        if re.search(r"mysql://|pymysql", content, re.IGNORECASE):
-            detected_datastores.add(("MySQL", "Database", "pymysql"))
 
-        # Redis client instantiation
-        if re.search(
-            r"redis\.Redis|redis\.StrictRedis|redis\.ConnectionPool", content
-        ):
-            detected_datastores.add(("Redis", "Cache", "redis-py"))
+def _imported_modules(node: Node) -> list[str]:
+    """The absolute modules an import statement names: each `import a.b`'s
+    (`import a.b as c` too), a `from a.b import c`'s `a.b`; none for a
+    relative one (`from . import x`, `from .redis import cache`)."""
+    if node.type == "import_from_statement":
+        module = node.child_by_field_name("module_name")
+        return [module.text.decode("utf-8")] if module is not None and module.type == "dotted_name" else []
+    modules = []
+    for name in node.children_by_field_name("name"):
+        if name.type == "aliased_import":
+            name = name.child_by_field_name("name")
+        modules.append(name.text.decode("utf-8"))
+    return modules
 
-        # Neo4j driver instantiation
-        if re.search(
-            r"neo4j\.GraphDatabase\.driver|from neo4j import GraphDatabase",
-            content,
-        ):
-            detected_datastores.add(("Neo4j", "Database", "neo4j-python-driver"))
 
-        # Qdrant client
-        if re.search(r"qdrant_client\.QdrantClient|from qdrant_client import", content):
-            detected_datastores.add(("Qdrant", "VectorStore", "qdrant-client"))
-
-        # Kafka producer/consumer
-        if re.search(
-            r"KafkaProducer|KafkaConsumer|kafka\.KafkaProducer",
-            content,
-        ):
-            detected_datastores.add(("Kafka", "Queue", "kafka-python"))
-
-        # RabbitMQ - pika
-        if re.search(r"pika\.BlockingConnection|pika\.ConnectionParameters", content):
-            detected_datastores.add(("RabbitMQ", "Queue", "pika"))
-
-        # RabbitMQ - kombu
-        if re.search(
-            r"kombu\.Connection|kombu\.Queue",
-            content,
-        ):
-            detected_datastores.add(("RabbitMQ", "Queue", "kombu"))
-
-        # MongoDB
-        if re.search(r"pymongo\.MongoClient|MongoClient\(", content):
-            detected_datastores.add(("MongoDB", "Database", "pymongo"))
-
-        # DuckDB
-        if re.search(r"duckdb\.connect|duckdb\.sql", content):
-            detected_datastores.add(("DuckDB", "Database", "duckdb"))
-
-        # Weaviate
-        if re.search(r"weaviate\.Client|from weaviate import", content):
-            detected_datastores.add(("Weaviate", "VectorStore", "weaviate-client"))
-
-        # Pinecone
-        if re.search(r"pinecone\.Index|pinecone\.init", content):
-            detected_datastores.add(("Pinecone", "VectorStore", "pinecone-client"))
-
-        # SQLite explicit usage
-        if re.search(
-            r"sqlite3\.connect|sqlite3\.Connection",
-            content,
-        ):
-            detected_datastores.add(("SQLite", "Database", "sqlite3"))
+def _string_value(node: Node | None) -> str | None:
+    """A plain string literal's value (no f-string substitution, not
+    implicitly concatenated); None for anything else."""
+    if node is None or node.type != "string":
+        return None
+    if any(child.type == "interpolation" for child in node.named_children):
+        return None
+    return "".join(
+        child.text.decode("utf-8", errors="replace") for child in node.named_children if child.type == "string_content"
+    )
 
 
 # --- Other languages' clients ------------------------------------------------
