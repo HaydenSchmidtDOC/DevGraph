@@ -2492,8 +2492,13 @@ def prune_stale_files(
     if not (docs_path and _is_repo_root(repo_root, docs_path)):
         misplaced = engine.delete_docs_notes_outside(repo_id, docs_folder)
         if misplaced:
-            logger.info(
-                "removed %d docs notes keyed outside %s from %s", misplaced, docs_folder or "the docs path", repo_id
+            # A warning: a note `annotate --note` indexed outside the docs
+            # path (or with none set) is gone without the user deleting it.
+            logger.warning(
+                "removed %d docs notes outside the docs path (%s) from %s: notes are indexed only under the "
+                "docs path; set it with `devgraph annotate %s --docs-path <folder>`",
+                misplaced, docs_folder or docs_path or "none set",
+                repo_id, repo_id,
             )
     # Mentions indexing turned off since: a fresh scan makes no Document.
     if not mentions_enabled:

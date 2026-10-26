@@ -639,6 +639,21 @@ def annotate(
                 if not is_within(note_path.resolve(), repo.path):
                     console.print("[red][X] Error:[/red] note path must be inside the repository")
                     raise typer.Exit(code=1)
+                # A scan indexes notes under the docs path only, and removes any
+                # other: one indexed here would be gone at the next catch-up.
+                current_docs = docs_path if docs_path is not None else repo.docs_path
+                if not current_docs:
+                    console.print(
+                        "[red][X] Error:[/red] no docs path is set; set it first with "
+                        f"'devgraph annotate {escape(repo_id)} --docs-path <folder>' (notes are indexed only under it)"
+                    )
+                    raise typer.Exit(code=1)
+                if not is_within(note_path.resolve(), (repo.path / current_docs).resolve()):
+                    console.print(
+                        f"[red][X] Error:[/red] the note is outside the docs path ({escape(current_docs)}); "
+                        "move it there, or change the docs path with --docs-path (notes are indexed only under it)"
+                    )
+                    raise typer.Exit(code=1)
 
                 settings = get_settings()
                 engine = GraphEngine(

@@ -145,7 +145,7 @@ with `type: requirement|design_decision|architecture_note` front-matter;
 
 ```bash
 "<venv python>" -P -m devgraph.cli.main annotate <repo_id> --docs-path <repo-relative docs folder>
-"<venv python>" -P -m devgraph.cli.main annotate <repo_id> --note <repo-relative note file>   # index one note immediately
+"<venv python>" -P -m devgraph.cli.main annotate <repo_id> --note <repo-relative note file>   # index one note under the docs path immediately
 ```
 
 **PR/issue history** is opt-in and talks to an external service (GitHub,
