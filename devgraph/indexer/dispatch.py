@@ -206,9 +206,17 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: CommonJS exports and functions declared in blocks. The datastore
 #: extractor also skips more test folders (`spec/`, `e2e/`, `__mocks__/`,
 #: `testdata/`, `fixtures/`, .NET `UnitTests`/`IntegrationTests`;
-#: devgraph/test_paths.py `TEST_DIR`).
+#: devgraph/test_paths.py `TEST_DIR`); 20: Python routes under their
+#: router's or blueprint's prefix (FastAPI `APIRouter(prefix=)` and
+#: `include_router(prefix=)`, Flask `Blueprint(url_prefix=)` and
+#: `register_blueprint(url_prefix=)`), a router another file mounts named by
+#: those mounts (apis/routes.py MountTable) and one mounted nowhere the file
+#: shows an Endpoint of its own file (`unmounted_endpoint`); and a compose
+#: service's build context resolved from the compose file's folder, the
+#: repository root (`build: .` at the root, `context: ..` one level down)
+#: owning every file no deeper context claims.
 #: An index stamped lower, or not at all, is rescanned automatically.
-INDEX_FORMAT = 19
+INDEX_FORMAT = 20
 
 
 def index_outdated(engine: GraphEngine, repo_id: str) -> bool:
@@ -733,9 +741,9 @@ def _sync_docs_edges(engine: GraphEngine, repo_id: str, repo_root: Path, applied
 
 
 class _Mounts:
-    """The repository's Express mounts across files (apis/routes.py
+    """The repository's Express, FastAPI and Flask mounts across files (apis/routes.py
     MountTable) for one batch: read from the graph when a file first needs
-    them, then kept current with each JS/TS file the batch writes."""
+    them, then kept current with each JS/TS or Python file the batch writes."""
 
     def __init__(self, engine: GraphEngine, repo_id: str):
         self.engine, self.repo_id = engine, repo_id
@@ -744,7 +752,7 @@ class _Mounts:
         self.touched = False  # whether a batch file has mounts or routes another file mounts
 
     def written(self, rel_path: str, mounts: list[str] | None, exports: list[str] | None) -> None:
-        """Record a JS/TS file's `route_mounts` as the batch writes it."""
+        """Record a JS/TS or Python file's `route_mounts` as the batch writes it."""
         self.touched |= bool(mounts or exports)
         if self.table is None:
             self.pending[rel_path] = mounts
@@ -769,15 +777,18 @@ class _Mounts:
         return state
 
 
-def _mounted(nodes: list[dict], rels: list[dict], rel_path: str, mounts: _Mounts) -> tuple[list[dict], list[dict]]:
-    """A JS/TS file's extraction with its exported routers' routes named by
+def _mounted(
+    nodes: list[dict], rels: list[dict], rel_path: str, mounts: _Mounts, keep_slash: bool = False,
+) -> tuple[list[dict], list[dict]]:
+    """A JS/TS or Python file's extraction with its exported routers' routes named by
     the mounts that reach them (apis/routes.py `mount_routes`), its Module
-    recording the prefixes used (`route_prefixes`)."""
+    recording the prefixes used (`route_prefixes`); `keep_slash` for a
+    Python file's, whose routes keep their trailing slash."""
     module = next(node for node in nodes if node["label"] == "Module" and node["name"] == rel_path)
     props = module["properties"]
     mounts.written(rel_path, props.get("route_mounts"), props.get("route_exports"))
     prefixes = mounts.prefixes(rel_path, props.get("route_exports"))
-    nodes, rels = mount_routes(nodes, rels, rel_path, props.get("route_exports"), prefixes)
+    nodes, rels = mount_routes(nodes, rels, rel_path, props.get("route_exports"), prefixes, keep_slash)
     props["route_prefixes"] = prefixes
     return nodes, rels
 
@@ -812,8 +823,8 @@ def index_paths(
             writer's text, its resolver configuration and whether its target
             exists (a tiered pin's, which nodes of its target's name exist:
             other files' tiered groups to a name whose nodes the batch adds,
-            removes or rekeys are written again). An Express router file
-            whose mounts in other files changed under it (apis/routes.py)
+            removes or rekeys are written again). An Express, FastAPI or
+            Flask router file whose mounts in other files changed under it (apis/routes.py)
             is indexed again with the batch (`_stale_mounts`).
         docs_path: The repo's configured docs folder (repo-relative), if any.
         mentions_enabled: Whether to index mentions in Markdown files.
@@ -1032,7 +1043,7 @@ def _index_paths(
         index_one(rel_path, by_rel_path[rel_path])
         if done % PROGRESS_EVERY == 0:
             logger.info("%s: indexed %d / %d files", repo_id, done, total)
-    # An Express router file another file mounts is named by those mounts
+    # A router file another file mounts is named by those mounts
     # (apis/routes.py), which the batch may have changed (or written after
     # it, in path order): every router file whose `route_prefixes` no
     # longer match is indexed again, joining the batch.
@@ -1186,7 +1197,8 @@ def _index_paths(
             # Read back only for a file a Service owns (the function's own first test).
             if _match_owning_service(services, rel_path) is not None:
                 content = extractions.load(entry)[2]
-                owned = partial(_owning_service_relationships, repo_id, rel_path, content, services)
+                endpoints = [node[1] for node in entry.nodes if node[0] == "Endpoint"]
+                owned = partial(_owning_service_relationships, repo_id, rel_path, content, services, endpoints)
                 try:
                     service_rels.extend(owned())
                 except RecursionError:
@@ -1400,11 +1412,16 @@ def _index_single_path(
         # branch. Passed the repo-relative path (not bare filename) so
         # their 'source'/'file' provenance properties match what
         # delete_nodes_by_source_file looks up on file deletion.
-        api_nodes, api_rels = _api_nodes_and_rels(
+        api_nodes, api_rels, route_props = _api_nodes_and_rels(
             repo_id, rel_path, content, config.python_roots(rel_path) if config is not None else (),
         )
         nodes = [n.to_dict() for n in result.nodes] + _datastore_nodes(repo_id, rel_path, content) + api_nodes
         rels = [r.to_dict() for r in result.relationships] + api_rels
+        # Its routers' mounts across files, as a JS/TS file's (apis/routes.py).
+        next(node for node in nodes if node["label"] == "Module" and node["name"] == rel_path)["properties"].update(
+            route_props
+        )
+        nodes, rels = _mounted(nodes, rels, rel_path, mounts, keep_slash=True)
         # Delete this file's previously-indexed nodes and write the
         # freshly-extracted ones in one transaction, not just
         # MERGE-upsert the current contents: a Function/Class removed
@@ -2269,7 +2286,7 @@ def remove_paths(
     shadow_names = _shadow_keys(
         (node[:4], node[4], None) for node in (engine.list_file_nodes(repo_id, gone_cs) if gone_cs else ())
     )
-    # Express mounts the deleted files held (apis/routes.py).
+    # Router mounts the deleted files held (apis/routes.py).
     mounted = engine.route_mount_state(repo_id, sorted(removed)) if removed else {}
     # Must match the repo-relative key index_paths() writes for every
     # extractor (Module/Class/Function/Document nodes, and shared nodes'
@@ -3115,13 +3132,14 @@ def _load_services_with_build_context(engine: GraphEngine, repo_id: str) -> dict
 
 
 def _match_owning_service(services: dict[str, tuple[str, str]], rel_path: str) -> str | None:
-    """Find the Service whose build_context is the longest prefix of rel_path's directory."""
+    """Find the Service whose build_context is the longest prefix of rel_path's
+    directory; a context of "" (the repository root) holds every file."""
     file_dir = rel_path.rsplit("/", 1)[0] if "/" in rel_path else ""
 
     best_match: str | None = None
     best_match_len = -1
     for name, (context, _file) in services.items():
-        if file_dir == context or file_dir.startswith(context + "/"):
+        if context == "" or file_dir == context or file_dir.startswith(context + "/"):
             if len(context) > best_match_len:
                 best_match = name
                 best_match_len = len(context)
@@ -3130,7 +3148,7 @@ def _match_owning_service(services: dict[str, tuple[str, str]], rel_path: str) -
 
 
 def _owning_service_relationships(
-    repo_id: str, rel_path: str, content: str, services: dict[str, tuple[str, str]]
+    repo_id: str, rel_path: str, content: str, services: dict[str, tuple[str, str]], endpoints: list[str],
 ) -> list[dict]:
     """USES/CALLS relationship dicts linking this file's Database/
     VectorStore/Queue and Endpoint nodes back to the compose Service that
@@ -3146,6 +3164,8 @@ def _owning_service_relationships(
     prefix wins, so a service at 'services/api' isn't shadowed by an
     unrelated top-level Service with no build_context. Each edge's `origin`
     is the Python file, so a compose file's re-index leaves it alone.
+    `endpoints` are the file's Endpoint names as the batch wrote them (a
+    router's named by the mounts reaching it, apis/routes.py).
     """
     owning_service = _match_owning_service(services, rel_path)
     if owning_service is None:
@@ -3154,8 +3174,6 @@ def _owning_service_relationships(
 
     datastore_result = DatastoreExtractor(repo_id).extract_from_source(content, rel_path)
     datastores = [(ds.datastore_type, ds.name) for ds in datastore_result.datastores]
-    api_result = APIExtractor(repo_id).extract_from_source(content, rel_path)
-    endpoints = [f"{endpoint.method} {endpoint.path}" for endpoint in api_result.endpoints]
     return _datastore_service_relationships(repo_id, rel_path, datastores, services) + _endpoint_service_relationships(
         repo_id, rel_path, endpoints, services
     )
@@ -3211,13 +3229,16 @@ def _endpoint_service_relationships(
 
 def _api_nodes_and_rels(
     repo_id: str, rel_path: str, content: str, roots: tuple[str, ...] = (),
-) -> tuple[list[dict], list[dict]]:
+) -> tuple[list[dict], list[dict], dict[str, list[str] | None]]:
+    """A Python file's Endpoint and handler stub nodes, its IMPLEMENTS edges,
+    and its Module's `route_mounts` and `route_exports` (apis/routes.py)."""
     result = APIExtractor(repo_id).extract_from_source(content, rel_path, roots)
     nodes = [
-        {"label": "Endpoint", "repo_id": repo_id, "name": f"{e.method} {e.path}", "properties": e.properties}
+        {"label": "Endpoint", "repo_id": repo_id, "name": e.name, "properties": e.properties}
         for e in result.endpoints
     ] + [
         {"label": "Function", "repo_id": repo_id, "name": f.name, "properties": f.properties}
         for f in result.functions
     ]
-    return nodes, [_relationship_dict(rel, repo_id, rel_path) for rel in result.relationships]
+    rels = [_relationship_dict(rel, repo_id, rel_path) for rel in result.relationships]
+    return nodes, rels, {"route_mounts": result.route_mounts, "route_exports": result.route_exports}

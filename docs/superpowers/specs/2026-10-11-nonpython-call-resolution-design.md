@@ -1321,7 +1321,9 @@ away, left every other file's edges at its old owner (the graph-accuracy
 design's out-of-scope "compose-only batch"). Those edges are a function of
 two things the graph holds: which files claim each Endpoint and datastore
 node (its `sources`) and the Services' build contexts (the longest one
-containing the file wins, `_match_owning_service`). So a batch holding a
+containing the file wins, `_match_owning_service`; since index format 20 a
+context is resolved from the compose file's folder and "", the repository
+root, contains every file). So a batch holding a
 compose file (`_is_compose`), and a `remove_paths` deleting one, run
 `dispatch._relink_owning_services` after the owning-service pass: one read
 of every claimed Endpoint and datastore node with its claiming files and of

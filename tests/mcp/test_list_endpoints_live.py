@@ -49,12 +49,15 @@ FILES = {
         function show(req, res) {}
         """,
     "admin/main.py": """\
-        from fastapi import APIRouter
+        from fastapi import APIRouter, FastAPI
+        app = FastAPI()
         router = APIRouter()
 
         @router.get("/api/users")
         def list_users():
             return []
+
+        app.include_router(router)
         """,
     "admin/urls.py": """\
         from django.urls import path

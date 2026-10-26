@@ -356,7 +356,8 @@ def test_a_route_implements_its_handlers_owner():
         """)
     result = APIExtractor("repo").extract_from_source(source, "api/routes.py")
     pinned = {(r.source_name, r.to_owner) for r in result.relationships if r.to_file == "api/routes.py"}
-    assert pinned == {("GET /items", ""), ("GET /users", "Views")}
+    # A router the file mounts on no app is mounted where it doesn't show.
+    assert pinned == {("GET /items", ""), ("GET ?/users (api/routes.py)", "Views")}
 
 
 def _heir_open(result):

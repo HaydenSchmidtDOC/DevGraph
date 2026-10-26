@@ -220,8 +220,8 @@ def legacy():
         assert targets == [
             ("GET /legacy", "legacy", ""),
             ("GET /legacy", "legacy", "api/routes.py"),
-            ("POST /items", "save", ""),
-            ("POST /items", "save", "api/routes.py"),
+            ("POST ?/items (api/routes.py)", "save", ""),
+            ("POST ?/items (api/routes.py)", "save", "api/routes.py"),
         ]
 
     def test_django_implements_stays_bare_name(self):
