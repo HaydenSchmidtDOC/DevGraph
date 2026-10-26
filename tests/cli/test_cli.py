@@ -896,6 +896,48 @@ def test_cli_tray_start_then_status_then_stop(runner, temp_registry_db):
         assert "not running" in final_status.stdout
 
 
+def test_cli_tray_stop_then_start_keeps_the_open_sessions_holds(runner, temp_registry_db):
+    """'devgraph update' runs 'tray stop' then 'tray start' while MCP sessions
+    stay open, and they never register again: their holds must survive, or
+    the first session to close stops the new agent under the others."""
+    db_path, registry = temp_registry_db
+    registry.close()
+
+    from devgraph.agent import lifecycle
+    from devgraph.cli import main as cli_main
+
+    old_agent, new_agent, session_a, session_b = 999991, 999992, 888881, 888882
+    alive = {old_agent, session_a, session_b}
+    processes = [MagicMock(pid=old_agent), MagicMock(pid=new_agent)]
+
+    config_module.get_settings.cache_clear()
+    with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(lifecycle, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(lifecycle.subprocess, "Popen", side_effect=processes), \
+         patch.object(lifecycle, "pid_is_running", side_effect=lambda pid: pid in alive), \
+         patch.object(lifecycle, "process_identity", side_effect=lambda pid: f"start-{pid}" if pid in alive else None), \
+         patch.object(lifecycle, "process_command", return_value=f"python -m {lifecycle.AGENT_MODULE}"), \
+         patch.object(lifecycle, "resolve_venv_python", return_value=Path("python")), \
+         patch.object(lifecycle, "resolve_repo_root", return_value=Path(".")), \
+         patch.object(lifecycle, "wait_for_tray", return_value="running"), \
+         patch.object(lifecycle, "tray_ui_problem", return_value=None), \
+         patch.object(lifecycle.os, "kill") as fake_kill:
+        assert runner.invoke(app, ["tray", "start"]).exit_code == 0
+        lifecycle.register_tray_holder(session_a)
+        lifecycle.register_tray_holder(session_b)
+
+        stop_result = runner.invoke(app, ["tray", "stop"])
+        assert stop_result.exit_code == 0, f"stdout: {stop_result.stdout}"
+        fake_kill.assert_called_once_with(old_agent, cli_main.signal.SIGTERM)  # 'tray stop' still stops it
+        alive.discard(old_agent)
+        alive.add(new_agent)
+        assert runner.invoke(app, ["tray", "start"]).exit_code == 0
+
+        assert lifecycle.stop_tray_if_last_holder(session_a) is False
+        assert fake_kill.call_count == 1  # session B still holds the new agent
+        assert lifecycle.read_tray_pid() == new_agent
+
+
 @pytest.mark.parametrize("platform, environment, relative", [
     ("win32", {"APPDATA": "roaming"}, "roaming/Code/User/mcp.json"),
     ("darwin", {}, "home/Library/Application Support/Code/User/mcp.json"),

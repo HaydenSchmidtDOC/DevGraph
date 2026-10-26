@@ -220,8 +220,8 @@ def legacy():
         assert targets == [
             ("GET /legacy", "legacy", ""),
             ("GET /legacy", "legacy", "api/routes.py"),
-            ("POST /items", "save", ""),
-            ("POST /items", "save", "api/routes.py"),
+            ("POST ?/items (api/routes.py)", "save", ""),
+            ("POST ?/items (api/routes.py)", "save", "api/routes.py"),
         ]
 
     def test_django_implements_stays_bare_name(self):
@@ -459,7 +459,7 @@ urlpatterns = [
 ]
 '''
     result = APIExtractor("repo").extract_from_source(code, "urls.py")
-    assert sorted({(r.source_name, r.target_name) for r in result.relationships}) == [
+    assert sorted({(r.source_name, r.target_name) for r in result.relationships if r.to_owner != "ArticleView"}) == [
         ("* ^articles/$", "ArticleView"), ("* users/", "list_users"),
     ]
 
@@ -527,4 +527,77 @@ urlpatterns = [
         ("* d/", "view", "", None),
         # A bare name nothing imports links every one of its name, as before.
         ("* e/", "local_view", "", None),
+    ]
+
+
+def test_a_class_based_view_implements_its_class_and_its_http_methods():
+    code = '''
+from django.urls import path
+
+from . import views
+from .orders import OrderView as Orders
+from api.views import ItemViewSet, StatusView
+
+urlpatterns = [
+    path("a/", views.CartView.as_view(template_name="cart.html")),
+    path("b/", Orders.as_view()),
+    path("c/", ItemViewSet.as_view({"get": "list", "post": "create", "put": action})),
+    path("d/", StatusView.as_view(actions={"get": "retrieve"})),
+    path("e/", unknown.LostView.as_view()),
+    path("f/", LocalView.as_view()),
+]
+'''
+    result = APIExtractor("repo").extract_from_source(code, "shop/urls.py")
+    targets = sorted(
+        (r.source_name, r.target_label, r.target_name, r.to_file, r.to_owner) for r in result.relationships
+    )
+    http = ("delete", "get", "head", "options", "patch", "post", "put", "trace")
+    assert targets == sorted([
+        # Django's View: the stub, the top-level Class in its module, and each HTTP method handler of it.
+        ("* a/", "Function", "CartView", "", None),
+        *(("* a/", "Class", "CartView", file, "") for file in ("shop/views.py", "shop/views/__init__.py")),
+        *(("* a/", "Function", method, file, "CartView")
+          for file in ("shop/views.py", "shop/views/__init__.py") for method in http),
+        # A from-import is the class it names, under its own name: the stub's too.
+        ("* b/", "Function", "OrderView", "", None),
+        *(("* b/", "Class", "OrderView", file, "") for file in ("shop/orders.py", "shop/orders/__init__.py")),
+        *(("* b/", "Function", method, file, "OrderView")
+          for file in ("shop/orders.py", "shop/orders/__init__.py") for method in http),
+        # A DRF ViewSet's literal action mapping: the actions it names.
+        ("* c/", "Function", "ItemViewSet", "", None),
+        *(("* c/", "Class", "ItemViewSet", file, "") for file in _API_VIEWS),
+        *(("* c/", "Function", action, file, "ItemViewSet") for file in _API_VIEWS for action in ("create", "list")),
+        ("* d/", "Function", "StatusView", "", None),
+        *(("* d/", "Class", "StatusView", file, "") for file in _API_VIEWS),
+        *(("* d/", "Function", "retrieve", file, "StatusView") for file in _API_VIEWS),
+        # Read off nothing the file imports: the stub alone.
+        ("* e/", "Function", "LostView", "", None),
+        # A bare name nothing imports: the stub and every Class of its name, no method.
+        ("* f/", "Function", "LocalView", "", None), ("* f/", "Class", "LocalView", None, None),
+    ])
+    assert {f.name for f in result.functions} == {
+        "CartView", "OrderView", "ItemViewSet", "StatusView", "LostView", "LocalView",
+    }
+
+
+_API_VIEWS = ("api/views.py", "api/views/__init__.py", "shop/api/views.py", "shop/api/views/__init__.py")
+
+
+def test_a_class_based_view_of_the_route_file_is_pinned_to_it():
+    code = '''
+from django.urls import path
+
+
+class LocalView:
+    def get(self, request):
+        return None
+
+
+urlpatterns = [path("local/", LocalView.as_view({"get": "get"}))]
+'''
+    result = APIExtractor("repo").extract_from_source(code, "shop/urls.py")
+    assert sorted((r.target_label, r.target_name, r.to_file, r.to_owner) for r in result.relationships) == [
+        ("Class", "LocalView", "shop/urls.py", ""),
+        ("Function", "LocalView", "", None),
+        ("Function", "get", "shop/urls.py", "LocalView"),
     ]

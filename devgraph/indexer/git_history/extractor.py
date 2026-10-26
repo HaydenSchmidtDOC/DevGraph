@@ -535,6 +535,13 @@ def sync_git_history(
             # a freshly-initialized repo, not an error. Nothing to sync.
             return {"mode": "noop", "commits_indexed": 0, "commits_deleted": 0}
         last = repo_record.last_indexed_commit
+        if last is not None and not engine.run_cypher(
+            "MATCH (c:Commit {repo_id: $repo_id, name: $sha}) RETURN c.name LIMIT 1",
+            {"repo_id": repo_id, "sha": last},
+        ):
+            # The graph was wiped or replaced since that sync (the registry
+            # outlives it): read the history again, as a first sync.
+            last = None
         shallow = _shallow_digest(repo)
         # A shallow clone deepened (or unshallowed) since: commits read as
         # boundaries then, with every file as touched, have parents now.

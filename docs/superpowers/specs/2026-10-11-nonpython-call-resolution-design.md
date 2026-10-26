@@ -355,7 +355,7 @@ Since index format 18:
   inline render prop, a `useCallback` body, nested ones) renders from the
   named function holding it (`_call_functions`), unless its tag names a
   parameter of a callback holding it (`items.map(Comp => <Comp />)`).
-  Calls there are still attributed to no one. A function is named when
+  Calls there are attributed to no one (until index format 20, below). A function is named when
   it is a declarator's or a class field's value (`_named_function`); its
   elements are its own.
 - A class component (`class Modal extends React.Component`) renders
@@ -424,6 +424,24 @@ a block had no node and their calls were attributed to no one (an
 The fuzz's `op_ts_service` adds and removes such a service (`svc`, with a
 nested object and a function declared in an `if`) in a TS file, which
 others call as `svc.run()`.
+
+**Calls inside callbacks** (index format 20, audit 8 item 2). A call inside
+an anonymous function (`useEffect(() => fetchOrder(id))`, `onClick={() =>
+save()}`, `.then(o => track(o))`, `xs.forEach(function (x) { ... })`, an
+inline Express handler) was attributed to no one, unlike a Python lambda's,
+a Go closure's or a Java, Kotlin, C#, Rust or C++ lambda's. `_call_functions`
+now keeps them for the named function (or Module) holding the callback, as
+it does the callback's JSX elements. A callback's parameters, destructured
+ones included, shadow there like a block's locals (`_block_names`), so
+`items.map(fn => fn())` links no function `fn`; a `const`/`let` in its body
+shadows inside it. A `function` expression (not an arrow) binds its own
+`this` (`_in_function_expression`), so `this.m()` there is not pinned to
+the class. A named nested function (`_named_function`) keeps its own calls.
+A method of an object literal `_object_path` does not define
+(`configure({ onDone() { ... } })`, `export default { methods: {...} }`)
+is walked the same way (`_anonymous_function`), binding its own `this`.
+The call-graph fixtures list no call inside a callback, so their measures
+are unchanged.
 
 ## Kotlin parse recovery (`devgraph/indexer/kotlin/extractor.py`)
 
@@ -1185,6 +1203,53 @@ A repository with no routes costs the same. What remains is linear in the
 routes (their Endpoint and stub claims, about 5.5 ms per label per route
 file, and their edges).
 
+### Django class-based views (index format 20)
+
+A Django route to a class-based view (`views.OrderView.as_view()`) had
+its `IMPLEMENTS` go to a `Function` named after the class, pinned to the
+view's module at owner "": no node matches that, so the route implemented
+only its file-less stub, which `_fold_target` could not fold and every
+answer showed as an unresolved handler beside the `Class`
+(`describe_node("OrderView")` was ambiguous between the two).
+
+- **The Class.** A view written as `X.as_view(...)` is the top-level
+  `Class` `X` (owner "") of the module it is imported from, pinned as a
+  function view is (graph-accuracy spec R3): `views.X` with `from . import
+  views` is `<dir>/views.py`'s or `views/__init__.py`'s, a from-imported
+  `X` its module's (under the name it imports, an alias's too, which the
+  stub now also takes). A bare name nothing imports is the route file's
+  own top-level class when it defines one, pinned to that file; any other
+  (a star import's) links every `Class` of its name, unpinned, and the
+  stub.
+- **Its HTTP method handlers.** The same pins also link the class's
+  methods (owner the class) that serve the route: Django's
+  `View.http_method_names` (`get`, `post`, `put`, `patch`, `delete`,
+  `head`, `options`, `trace`) for a plain `as_view()`, or the actions a
+  DRF ViewSet's literal `as_view({"get": "list", ...})` mapping names. A
+  method links when the class defines it or inherits it from a class of
+  its own file (an owned pin's heir keys, index format 18); one inherited
+  from Django itself or from another file has no node of the class and
+  links nothing. An unpinned bare-name view links no method: an unpinned
+  owner would match every class's. The Class alone would leave
+  `trace_request_flow` to reach the code through `CONTAINS`; the methods
+  say which code serves a request and put it in `list_endpoints`.
+- **Folding.** `_fold_target` folds a stub into the one Function or Class
+  of its name that its Endpoint also implements, else the one Function or
+  Class of its name in its route files. `describe_node` of the Class lists its stubs'
+  relationships as its own (`_FOLDED_STUBS`), and `list_endpoints` gives
+  each handler's `label`.
+- **DRF.** `APIView.as_view()` is the same shape. A ViewSet registered on
+  a router (`router.register("items", ItemViewSet)`, then
+  `path("", include(router.urls))`) is not read: its URLs come from the
+  router at run time, so it has no Endpoint.
+- **Incremental equals fresh.** The pins are recorded in `name_refs` like
+  every pinned route edge, so a batch adding the class or a method
+  relinks it, and a route file whose stub's name a batch adds as a Class
+  is re-read as for a Function (`_handler_stub_referrers`).
+  `test_extract_coverage_live.py` renames the class, moves it into a
+  package and back, deletes and restores its module and adds a method,
+  comparing with a fresh scan each time.
+
 ## Datastore clients beyond Python (index format 18)
 
 `Service -USES->` a datastore came from Python files alone, so
@@ -1236,6 +1301,28 @@ edge are functions of the file's text and the compose files. The fuzz
 toggles clients' imports in Python, TS, Java, Kotlin, C# and Go files
 (`op_datastore`); `tests/indexer/test_client_datastores_live.py` scans one
 service per language. C++ and Rust clients are not read.
+
+**Python from the syntax tree** (index format 20, audit 8 item 3). The
+Python `DatastoreExtractor` was a regular expression over the whole file:
+`import\s+(\S+)` matched by prefix (`redistricting` was Redis), and
+`postgresql://`, `pymysql`, `MongoClient(` and the like anywhere in the
+text, a comment, a docstring or the extractor's own tables, made a store,
+and a test folder was not skipped (DevGraph's own repository had 13
+stores, two real). It now walks the Tree-sitter Python tree: an
+`import`/`from ... import` of a client module (`DATASTORE_LIBRARY_MAP`: the
+module itself or one below it, `redis.asyncio`; never a relative import;
+`pymysql` for MySQL), a known client call on a real call node
+(`CLIENT_CALLS`: `psycopg2.connect(...)`, `redis.Redis(...)`), and a
+connection URL that is a call's argument, positional or keyword
+(`create_engine("postgresql://...")`, the schemes above, and for every
+language SQLAlchemy's `dialect+driver` form, `postgresql+asyncpg://`); an
+f-string counts by its literal start (`f"postgresql://{host}/db"`), an
+implicit concatenation not at all. A file under a test folder (`TEST_DIR`) names
+none, and its node per provider takes the alphabetically first library, as
+the other languages' do. Both dispatcher call sites (`_datastore_nodes`,
+`_owning_service_relationships`) go through it.
+`tests/indexer/test_python_datastores_syntax.py` and
+`test_python_datastores_live.py`.
 
 ## Express routers mounted from another file (index format 18)
 
@@ -1321,7 +1408,9 @@ away, left every other file's edges at its old owner (the graph-accuracy
 design's out-of-scope "compose-only batch"). Those edges are a function of
 two things the graph holds: which files claim each Endpoint and datastore
 node (its `sources`) and the Services' build contexts (the longest one
-containing the file wins, `_match_owning_service`). So a batch holding a
+containing the file wins, `_match_owning_service`; since index format 20 a
+context is resolved from the compose file's folder and "", the repository
+root, contains every file). So a batch holding a
 compose file (`_is_compose`), and a `remove_paths` deleting one, run
 `dispatch._relink_owning_services` after the owning-service pass: one read
 of every claimed Endpoint and datastore node with its claiming files and of

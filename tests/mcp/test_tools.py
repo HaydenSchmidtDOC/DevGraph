@@ -8,6 +8,8 @@ repo_id scoping holds — no cross-repo leakage without opt-in.
 Cleans up smoketest data (delete by repo_id) when done.
 """
 
+import uuid
+
 import pytest
 
 from devgraph.graph.engine import GraphEngine
@@ -21,6 +23,11 @@ from devgraph.mcp.tools import (
     explain_architecture,
     list_services,
 )
+
+# Unique per run, so sessions sharing the Neo4j never seed or delete each
+# other's repositories; tests/conftest.py sweeps any a teardown leaves.
+_TOKEN = uuid.uuid4().hex[:8]
+REPO_A, REPO_B = f"test_repo_a_{_TOKEN}", f"test_repo_b_{_TOKEN}"
 
 
 @pytest.fixture
@@ -44,46 +51,46 @@ def engine():
 def seeded_graph(engine):
     """Seed a fixture graph with two repos to test isolation."""
     # Repo 1: test_repo_a
-    engine.upsert_repository("test_repo_a", "Test Repo A", "/path/to/repo_a")
-    engine.upsert_node("Service", "test_repo_a", "UserService")
-    engine.upsert_node("Service", "test_repo_a", "AuthService")
-    engine.upsert_node("Database", "test_repo_a", "PostgresDB")
-    engine.upsert_node("Module", "test_repo_a", "auth.py")
-    engine.upsert_node("Class", "test_repo_a", "AuthHandler")
-    engine.upsert_node("Function", "test_repo_a", "validate_token")
-    engine.upsert_node("Endpoint", "test_repo_a", "POST /auth/login")
-    engine.upsert_node("VectorStore", "test_repo_a", "QdrantDB")
+    engine.upsert_repository(REPO_A, "Test Repo A", "/path/to/repo_a")
+    engine.upsert_node("Service", REPO_A, "UserService")
+    engine.upsert_node("Service", REPO_A, "AuthService")
+    engine.upsert_node("Database", REPO_A, "PostgresDB")
+    engine.upsert_node("Module", REPO_A, "auth.py")
+    engine.upsert_node("Class", REPO_A, "AuthHandler")
+    engine.upsert_node("Function", REPO_A, "validate_token")
+    engine.upsert_node("Endpoint", REPO_A, "POST /auth/login")
+    engine.upsert_node("VectorStore", REPO_A, "QdrantDB")
 
     # Relationships in repo_a
-    engine.upsert_relationship("Service", "UserService", "CALLS", "Service", "AuthService", "test_repo_a")
-    engine.upsert_relationship("Service", "AuthService", "USES", "Database", "PostgresDB", "test_repo_a")
-    engine.upsert_relationship("Service", "AuthService", "USES", "VectorStore", "QdrantDB", "test_repo_a")
-    engine.upsert_relationship("Endpoint", "POST /auth/login", "CALLS", "Service", "AuthService", "test_repo_a")
-    engine.upsert_relationship("Module", "auth.py", "CONTAINS", "Class", "AuthHandler", "test_repo_a")
-    engine.upsert_relationship("Class", "AuthHandler", "CONTAINS", "Function", "validate_token", "test_repo_a")
+    engine.upsert_relationship("Service", "UserService", "CALLS", "Service", "AuthService", REPO_A)
+    engine.upsert_relationship("Service", "AuthService", "USES", "Database", "PostgresDB", REPO_A)
+    engine.upsert_relationship("Service", "AuthService", "USES", "VectorStore", "QdrantDB", REPO_A)
+    engine.upsert_relationship("Endpoint", "POST /auth/login", "CALLS", "Service", "AuthService", REPO_A)
+    engine.upsert_relationship("Module", "auth.py", "CONTAINS", "Class", "AuthHandler", REPO_A)
+    engine.upsert_relationship("Class", "AuthHandler", "CONTAINS", "Function", "validate_token", REPO_A)
 
     # Repo 2: test_repo_b (separate repo to test isolation)
-    engine.upsert_repository("test_repo_b", "Test Repo B", "/path/to/repo_b")
-    engine.upsert_node("Service", "test_repo_b", "NotificationService")
-    engine.upsert_node("Database", "test_repo_b", "MongoDb")
-    engine.upsert_node("Queue", "test_repo_b", "RabbitMQ")
-    engine.upsert_node("Endpoint", "test_repo_b", "POST /notify/send")
+    engine.upsert_repository(REPO_B, "Test Repo B", "/path/to/repo_b")
+    engine.upsert_node("Service", REPO_B, "NotificationService")
+    engine.upsert_node("Database", REPO_B, "MongoDb")
+    engine.upsert_node("Queue", REPO_B, "RabbitMQ")
+    engine.upsert_node("Endpoint", REPO_B, "POST /notify/send")
 
-    engine.upsert_relationship("Service", "NotificationService", "USES", "Database", "MongoDb", "test_repo_b")
-    engine.upsert_relationship("Service", "NotificationService", "USES", "Queue", "RabbitMQ", "test_repo_b")
-    engine.upsert_relationship("Endpoint", "POST /notify/send", "CALLS", "Service", "NotificationService", "test_repo_b")
+    engine.upsert_relationship("Service", "NotificationService", "USES", "Database", "MongoDb", REPO_B)
+    engine.upsert_relationship("Service", "NotificationService", "USES", "Queue", "RabbitMQ", REPO_B)
+    engine.upsert_relationship("Endpoint", "POST /notify/send", "CALLS", "Service", "NotificationService", REPO_B)
 
     yield engine
 
     # Cleanup: delete both repos
-    engine.delete_repository("test_repo_a")
-    engine.delete_repository("test_repo_b")
+    engine.delete_repository(REPO_A)
+    engine.delete_repository(REPO_B)
 
 
 class TestSearchComponent:
     def test_search_by_name(self, seeded_graph):
         """Test searching components by name within a single repo."""
-        result = search_component(seeded_graph, "test_repo_a", "Auth", cross_repo=False)
+        result = search_component(seeded_graph, REPO_A, "Auth", cross_repo=False)
         assert "results" in result and "count" in result and "truncated" in result
         names = [r["name"] for r in result["results"]]
         assert len(names) > 0
@@ -92,20 +99,20 @@ class TestSearchComponent:
 
     def test_search_cross_repo(self, seeded_graph):
         """Test that cross_repo=True returns results from multiple repos."""
-        result = search_component(seeded_graph, "test_repo_a", "AuthService", cross_repo=True)
+        result = search_component(seeded_graph, REPO_A, "AuthService", cross_repo=True)
         names = [r["name"] for r in result["results"]]
         # Search specifically for AuthService to avoid hitting the LIMIT 50 cap with cross-repo results
         assert "AuthService" in names
 
     def test_no_cross_repo_leakage_default(self, seeded_graph):
         """Test that default (cross_repo=False) doesn't leak repo_b data."""
-        result = search_component(seeded_graph, "test_repo_a", "Notification", cross_repo=False)
+        result = search_component(seeded_graph, REPO_A, "Notification", cross_repo=False)
         names = [r["name"] for r in result["results"]]
         assert "NotificationService" not in names
 
     def test_search_truncation(self, seeded_graph):
         """Test that truncated flag is set when total count exceeds max_results."""
-        result = search_component(seeded_graph, "test_repo_a", "Auth", cross_repo=False, max_results=1)
+        result = search_component(seeded_graph, REPO_A, "Auth", cross_repo=False, max_results=1)
         assert "truncated" in result
         assert "count" in result
         assert "results" in result
@@ -118,7 +125,7 @@ class TestSearchComponent:
 class TestGetServiceDependencies:
     def test_get_dependencies_single_repo(self, seeded_graph):
         """Test getting dependencies for a service in a single repo."""
-        result = get_service_dependencies(seeded_graph, "test_repo_a", "AuthService", cross_repo=False)
+        result = get_service_dependencies(seeded_graph, REPO_A, "AuthService", cross_repo=False)
         assert result["service"] == "AuthService"
         # Should have PostgresDB and QdrantDB as dependencies
         dep_names = [d["name"] for d in result.get("dependencies", [])]
@@ -130,7 +137,7 @@ class TestGetServiceDependencies:
 
     def test_service_dependencies_no_cross_repo(self, seeded_graph):
         """Test that dependencies don't cross repo boundaries by default."""
-        result = get_service_dependencies(seeded_graph, "test_repo_a", "UserService", cross_repo=False)
+        result = get_service_dependencies(seeded_graph, REPO_A, "UserService", cross_repo=False)
         assert result["service"] == "UserService"
         # Should call AuthService (same repo)
         call_names = [c["name"] for c in result.get("calls", [])]
@@ -142,7 +149,7 @@ class TestGetServiceDependencies:
 class TestFindCallers:
     def test_find_callers_single_repo(self, seeded_graph):
         """Test finding callers of a function."""
-        result = find_callers(seeded_graph, "test_repo_a", "AuthService", cross_repo=False)
+        result = find_callers(seeded_graph, REPO_A, "AuthService", cross_repo=False)
         assert "results" in result and "count" in result and "truncated" in result
         # Should find UserService and Endpoint as callers
         names = [r["name"] for r in result["results"]]
@@ -152,7 +159,7 @@ class TestFindCallers:
 
     def test_find_callers_cross_repo(self, seeded_graph):
         """Test finding callers with cross_repo=True."""
-        result = find_callers(seeded_graph, "test_repo_a", "AuthService", cross_repo=True)
+        result = find_callers(seeded_graph, REPO_A, "AuthService", cross_repo=True)
         names = [r["name"] for r in result["results"]]
         # Should still only find callers of this specific service
         assert "UserService" in names
@@ -161,7 +168,7 @@ class TestFindCallers:
 
     def test_find_callers_truncation(self, seeded_graph):
         """Test that truncated flag is set when total count exceeds max_results."""
-        result = find_callers(seeded_graph, "test_repo_a", "AuthService", cross_repo=False, max_results=1)
+        result = find_callers(seeded_graph, REPO_A, "AuthService", cross_repo=False, max_results=1)
         assert "truncated" in result
         assert "count" in result
         # If count > max_results, truncated should be True
@@ -172,7 +179,7 @@ class TestFindCallers:
     def test_find_callers_ranks_by_confidence_and_can_keep_only_resolved(self, engine):
         """Each caller once, with its best confidence, resolved callers first;
         resolved_only drops bare-name matches and edges with no confidence."""
-        repo_id = "_smoketest_call_confidence"
+        repo_id = f"_smoketest_call_confidence_{_TOKEN}"
         engine.delete_repository(repo_id)
         engine.upsert_repository(repo_id, "Confidence Test Repo", "/path/to/repo")
         engine.upsert_nodes([
@@ -211,7 +218,7 @@ class TestFindCallers:
         matching caller_class property (set by the Python extractor for
         method-body calls), cutting noise from unrelated same-named methods.
         """
-        repo_id = "_smoketest_scope_to_class"
+        repo_id = f"_smoketest_scope_to_class_{_TOKEN}"
         engine.upsert_repository(repo_id, "Scope Test Repo", "/path/to/repo")
         engine.upsert_node("Function", repo_id, "helper")
         engine.upsert_node("Function", repo_id, "process_a")
@@ -240,7 +247,7 @@ class TestFindCallers:
 class TestFindRelatedFiles:
     def test_find_related_files_single_repo(self, seeded_graph):
         """Test finding files related to a component."""
-        result = find_related_files(seeded_graph, "test_repo_a", "validate_token", cross_repo=False)
+        result = find_related_files(seeded_graph, REPO_A, "validate_token", cross_repo=False)
         # Each key should now be an envelope with count/results/truncated
         assert "containing_modules" in result and isinstance(result["containing_modules"], dict)
         assert "imported_modules" in result and isinstance(result["imported_modules"], dict)
@@ -250,7 +257,7 @@ class TestFindRelatedFiles:
 
     def test_find_related_files_truncation(self, seeded_graph):
         """Test that truncated flag is set when total count exceeds max_results."""
-        result = find_related_files(seeded_graph, "test_repo_a", "validate_token", cross_repo=False, max_results=1)
+        result = find_related_files(seeded_graph, REPO_A, "validate_token", cross_repo=False, max_results=1)
         for key in ["containing_modules", "imported_modules", "related_components"]:
             assert "truncated" in result[key]
             assert "count" in result[key]
@@ -263,8 +270,8 @@ class TestFindRelatedFiles:
 class TestSummariseRepository:
     def test_summarise_repo_a(self, seeded_graph):
         """Test repository summary for repo_a."""
-        result = summarise_repository(seeded_graph, "test_repo_a")
-        assert result["repo_name"] == "test_repo_a"
+        result = summarise_repository(seeded_graph, REPO_A)
+        assert result["repo_name"] == REPO_A
         assert result["service_count"] >= 2  # UserService, AuthService
         assert result["module_count"] >= 1  # auth.py
         assert result["class_count"] >= 1  # AuthHandler
@@ -275,8 +282,8 @@ class TestSummariseRepository:
 
     def test_summarise_repo_b(self, seeded_graph):
         """Test repository summary for repo_b."""
-        result = summarise_repository(seeded_graph, "test_repo_b")
-        assert result["repo_name"] == "test_repo_b"
+        result = summarise_repository(seeded_graph, REPO_B)
+        assert result["repo_name"] == REPO_B
         assert result["service_count"] >= 1  # NotificationService
         assert result["database_count"] >= 1  # MongoDb
         assert result["queue_count"] >= 1  # RabbitMQ
@@ -293,7 +300,7 @@ class TestSummariseRepository:
         """
         import time
 
-        repo_id = "_smoketest_summarise_scale"
+        repo_id = f"_smoketest_summarise_scale_{_TOKEN}"
         engine.upsert_repository(repo_id, "Scale Test", "/tmp/scale")
         for i in range(150):
             engine.upsert_node("Class", repo_id, f"Class{i}", {})
@@ -317,7 +324,7 @@ class TestSummariseRepository:
 class TestImpactAnalysis:
     def test_impact_analysis_single_repo(self, seeded_graph):
         """Test impact analysis for a component."""
-        result = impact_analysis(seeded_graph, "test_repo_a", "AuthService", cross_repo=False)
+        result = impact_analysis(seeded_graph, REPO_A, "AuthService", cross_repo=False)
         # direct_dependents and transitive_dependents should now be envelopes
         assert "direct_dependents" in result and isinstance(result["direct_dependents"], dict)
         assert "transitive_dependents" in result and isinstance(result["transitive_dependents"], dict)
@@ -330,7 +337,7 @@ class TestImpactAnalysis:
 
     def test_impact_analysis_truncation(self, seeded_graph):
         """Test that truncated flag is set when total count exceeds max_results."""
-        result = impact_analysis(seeded_graph, "test_repo_a", "AuthService", cross_repo=False, max_results=1)
+        result = impact_analysis(seeded_graph, REPO_A, "AuthService", cross_repo=False, max_results=1)
         assert "truncated" in result["direct_dependents"]
         assert "count" in result["direct_dependents"]
         # If count > max_results, truncated should be True
@@ -342,7 +349,7 @@ class TestImpactAnalysis:
 class TestExplainArchitecture:
     def test_explain_architecture_basic(self, seeded_graph):
         """Test architectural explanation."""
-        result = explain_architecture(seeded_graph, "test_repo_a")
+        result = explain_architecture(seeded_graph, REPO_A)
         assert "services_and_datastores" in result
         assert "endpoints" in result
 
@@ -350,7 +357,7 @@ class TestExplainArchitecture:
 class TestListServices:
     def test_list_services_single_repo(self, seeded_graph):
         """Test listing services in a single repo."""
-        result = list_services(seeded_graph, "test_repo_a", cross_repo=False)
+        result = list_services(seeded_graph, REPO_A, cross_repo=False)
         assert "results" in result and "count" in result and "truncated" in result
         names = [r["name"] for r in result["results"]]
         assert "UserService" in names
@@ -365,7 +372,7 @@ class TestListServices:
         # the other repo at all", not "it fits in the first 15 rows" -- with
         # the default envelope, a machine with enough real repos truncates
         # test_repo_b's services away and fails a tool that works correctly.
-        result = list_services(seeded_graph, "test_repo_a", cross_repo=True, max_results=500)
+        result = list_services(seeded_graph, REPO_A, cross_repo=True, max_results=500)
         names = [r["name"] for r in result["results"]]
         assert "UserService" in names
         assert "AuthService" in names
@@ -374,13 +381,13 @@ class TestListServices:
     def test_list_services_isolation(self, seeded_graph):
         """Test that repo_id isolation is enforced even with cross_repo=True."""
         # All results should have repo_id specified
-        result = list_services(seeded_graph, "test_repo_a", cross_repo=True)
+        result = list_services(seeded_graph, REPO_A, cross_repo=True)
         for item in result["results"]:
             assert "repo_id" in item
 
     def test_list_services_truncation(self, seeded_graph):
         """Test that truncated flag is set when total count exceeds max_results."""
-        result = list_services(seeded_graph, "test_repo_a", cross_repo=False, max_results=1)
+        result = list_services(seeded_graph, REPO_A, cross_repo=False, max_results=1)
         assert "truncated" in result
         assert "count" in result
         # If count > max_results, truncated should be True
@@ -396,10 +403,10 @@ class TestRepoIdScoping:
         """Verify that NO tool leaks data across repos without explicit opt-in."""
         # Test multiple tools to verify isolation is pervasive
         tools_to_test = [
-            ("search_component", lambda: search_component(seeded_graph, "test_repo_a", "Service", cross_repo=False)),
-            ("list_services", lambda: list_services(seeded_graph, "test_repo_a", cross_repo=False)),
-            ("get_service_dependencies", lambda: get_service_dependencies(seeded_graph, "test_repo_a", "AuthService", cross_repo=False)),
-            ("find_callers", lambda: find_callers(seeded_graph, "test_repo_a", "AuthService", cross_repo=False)),
+            ("search_component", lambda: search_component(seeded_graph, REPO_A, "Service", cross_repo=False)),
+            ("list_services", lambda: list_services(seeded_graph, REPO_A, cross_repo=False)),
+            ("get_service_dependencies", lambda: get_service_dependencies(seeded_graph, REPO_A, "AuthService", cross_repo=False)),
+            ("find_callers", lambda: find_callers(seeded_graph, REPO_A, "AuthService", cross_repo=False)),
         ]
 
         for tool_name, tool_call in tools_to_test:
@@ -433,10 +440,10 @@ class TestRepoIdScoping:
     def test_cross_repo_opt_in_explicit(self, seeded_graph):
         """Verify cross_repo=True must be explicitly set to get cross-repo data."""
         # Call with cross_repo=False explicitly
-        result_isolated = search_component(seeded_graph, "test_repo_a", "Service", cross_repo=False)
+        result_isolated = search_component(seeded_graph, REPO_A, "Service", cross_repo=False)
 
         # Call with cross_repo=True
-        result_cross = search_component(seeded_graph, "test_repo_a", "Service", cross_repo=True)
+        result_cross = search_component(seeded_graph, REPO_A, "Service", cross_repo=True)
 
         # cross_repo results should be >= isolated results
         assert len(result_cross["results"]) >= len(result_isolated["results"])

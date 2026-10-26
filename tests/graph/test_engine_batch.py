@@ -2,10 +2,16 @@
 upsert_relationships, replace_file_nodes) — the UNWIND-grouped, single-
 transaction alternative to upserting one node/edge per round-trip."""
 
+import uuid
+
 import neo4j
 import pytest
 
 from devgraph.graph.engine import GraphEngine
+
+# Unique per run, so sessions sharing the Neo4j never seed or delete each
+# other's repositories; tests/conftest.py sweeps any a teardown leaves.
+_TOKEN = uuid.uuid4().hex[:8]
 
 
 @pytest.fixture
@@ -22,7 +28,7 @@ def engine():
 
 class TestUpsertNodes:
     def test_creates_nodes_with_mixed_labels(self, engine):
-        repo_id = "_smoketest_batch_nodes_mixed"
+        repo_id = f"_smoketest_batch_nodes_mixed_{_TOKEN}"
         nodes = [
             {"label": "Module", "repo_id": repo_id, "name": "a.py", "properties": {"type": "module"}},
             {"label": "Class", "repo_id": repo_id, "name": "A", "properties": {"file": "a.py"}},
@@ -43,7 +49,7 @@ class TestUpsertNodes:
             engine.delete_repository(repo_id)
 
     def test_rerunning_the_same_batch_does_not_duplicate(self, engine):
-        repo_id = "_smoketest_batch_nodes_idempotent"
+        repo_id = f"_smoketest_batch_nodes_idempotent_{_TOKEN}"
         nodes = [{"label": "Module", "repo_id": repo_id, "name": "a.py", "properties": {}}]
         try:
             engine.upsert_nodes(nodes)
@@ -61,7 +67,7 @@ class TestUpsertNodes:
 
 class TestUpsertRelationships:
     def test_merges_edges_with_mixed_triples(self, engine):
-        repo_id = "_smoketest_batch_rels_mixed"
+        repo_id = f"_smoketest_batch_rels_mixed_{_TOKEN}"
         try:
             engine.upsert_nodes(
                 [
@@ -105,7 +111,7 @@ class TestUpsertRelationships:
             engine.delete_repository(repo_id)
 
     def test_edge_to_nonexistent_node_is_silently_absent(self, engine):
-        repo_id = "_smoketest_batch_rels_dangling"
+        repo_id = f"_smoketest_batch_rels_dangling_{_TOKEN}"
         try:
             engine.upsert_nodes([{"label": "Module", "repo_id": repo_id, "name": "a.py", "properties": {}}])
             engine.upsert_relationships(
@@ -134,7 +140,7 @@ class TestUpsertRelationships:
 
 class TestReplaceFileNodes:
     def test_replaces_old_nodes_with_new_ones(self, engine):
-        repo_id = "_smoketest_replace_file_nodes"
+        repo_id = f"_smoketest_replace_file_nodes_{_TOKEN}"
         try:
             engine.upsert_node("Function", repo_id, "old_func", {"source_file": "f.py"})
             engine.upsert_node("Module", repo_id, "unrelated.py", {"source_file": "unrelated.py"})
@@ -158,7 +164,7 @@ class TestReplaceFileNodes:
             engine.delete_repository(repo_id)
 
     def test_calling_twice_with_different_content_leaves_no_stale_nodes(self, engine):
-        repo_id = "_smoketest_replace_file_nodes_twice"
+        repo_id = f"_smoketest_replace_file_nodes_twice_{_TOKEN}"
         try:
             engine.replace_file_nodes(
                 repo_id,
@@ -190,7 +196,7 @@ class TestReplaceFileNodes:
 
 class TestBatchingReducesRoundTrips:
     def test_replace_file_nodes_issues_a_small_constant_number_of_tx_run_calls(self, engine, monkeypatch):
-        repo_id = "_smoketest_batch_round_trips"
+        repo_id = f"_smoketest_batch_round_trips_{_TOKEN}"
         call_count = {"n": 0}
         original_run = neo4j.ManagedTransaction.run
 
@@ -363,7 +369,7 @@ class TestIndexesStillBuilding:
     def test_a_write_waits_for_the_index_and_is_not_dropped(self, engine, monkeypatch):
         import devgraph.graph.engine as engine_module
 
-        repo_id = "_smoketest_index_building_write"
+        repo_id = f"_smoketest_index_building_write_{_TOKEN}"
         monkeypatch.setattr(engine_module.time, "sleep", lambda _s: None)
         left = _fail_hinted_queries(monkeypatch, 2)
         try:
@@ -384,7 +390,7 @@ class TestIndexesStillBuilding:
         monkeypatch.setattr(engine_module.time, "monotonic", lambda: clock["t"])
         _fail_hinted_queries(monkeypatch, 10**6)
         with pytest.raises(engine_module.IndexesNotReady):
-            engine.list_file_nodes("_smoketest_index_building_read", ["a.py"])
+            engine.list_file_nodes(f"_smoketest_index_building_read_{_TOKEN}", ["a.py"])
         assert clock["t"] >= engine_module.INDEX_WAIT_S
 
     def test_init_schema_waits_for_the_indexes_it_creates(self, engine, monkeypatch):

@@ -619,8 +619,9 @@ PY_ROOTS = ["src/", "", "code/"]
 # The source roots a Java file moves between (another Maven module).
 JAVA_ROOTS = ["java/", "lib/src/main/java/"]
 SERVICES = ["api", "web", "worker", "db"]
-# The folders a compose service builds from (ts/src inside ts: the nearest wins).
-BUILD_CONTEXTS = ["py", "ts", "ts/src", "java", "go", "cs", "kt", "pkg"]
+# The folders a compose service builds from (ts/src inside ts: the nearest wins;
+# "." the repository root, which owns every file no other context claims).
+BUILD_CONTEXTS = ["py", "ts", "ts/src", "java", "go", "cs", "kt", "pkg", "."]
 IMAGES = ["python:3.12", "nginx:1.27", "postgres:16", "alpine:3.20"]
 EXTRA_NAMES = ["Foo", "Display", "Server", "K", "Child", "python", "postgres", "py/b.py", "missing", "act", "shared"]
 CODE = ("py", "rs", "go", "java", "ts", "kt", "cs", "cpp")

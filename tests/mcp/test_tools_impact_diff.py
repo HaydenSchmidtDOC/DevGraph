@@ -4,6 +4,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,10 @@ from devgraph.graph.engine import GraphEngine
 from devgraph.indexer.python.extractor import index_file
 from devgraph.mcp.tools import impact_analysis_for_diff
 from devgraph.registry.store import RepoRegistry
+
+# Unique per run, so sessions sharing the Neo4j never seed or delete each
+# other's repositories; tests/conftest.py sweeps any a teardown leaves.
+_TOKEN = uuid.uuid4().hex[:8]
 
 
 def _run_git(repo_path: Path, *args: str) -> None:
@@ -75,7 +80,7 @@ def diff_repo():
 
 def test_impact_analysis_for_diff_end_to_end(graph_engine, registry, diff_repo):
     repo_path, base_sha, head_sha = diff_repo
-    repo_id = "_smoketest_impact_diff"
+    repo_id = f"_smoketest_impact_diff_{_TOKEN}"
     registry.add_repo(repo_path, repo_id=repo_id)
 
     index_file(graph_engine, repo_id, repo_path / "helper.py", repo_root=repo_path)
@@ -97,7 +102,7 @@ def test_impact_analysis_for_diff_end_to_end(graph_engine, registry, diff_repo):
 
 def test_impact_analysis_for_diff_invalid_ref_is_a_tool_error(graph_engine, registry, diff_repo):
     repo_path, base_sha, _head_sha = diff_repo
-    repo_id = "_smoketest_impact_diff_bad_ref"
+    repo_id = f"_smoketest_impact_diff_bad_ref_{_TOKEN}"
     registry.add_repo(repo_path, repo_id=repo_id)
 
     with pytest.raises(ToolError, match="head_ref 'not-a-real-ref-xyz' is not a branch, tag or commit"):
@@ -108,7 +113,7 @@ def test_impact_analysis_for_diff_invalid_ref_is_a_tool_error(graph_engine, regi
 
 def test_impact_analysis_for_diff_empty_diff_returns_empty(graph_engine, registry, diff_repo):
     repo_path, base_sha, _head_sha = diff_repo
-    repo_id = "_smoketest_impact_diff_empty"
+    repo_id = f"_smoketest_impact_diff_empty_{_TOKEN}"
     registry.add_repo(repo_path, repo_id=repo_id)
 
     try:
@@ -150,7 +155,7 @@ def symbol_repo(tmp_path):
 
 
 def test_only_changed_and_removed_symbols_are_traced_and_added_ones_are_listed(graph_engine, registry, symbol_repo):
-    repo_id = "_smoketest_impact_diff_symbols"
+    repo_id = f"_smoketest_impact_diff_symbols_{_TOKEN}"
     registry.add_repo(symbol_repo, repo_id=repo_id)
     index_file(graph_engine, repo_id, symbol_repo / "mod.py", repo_root=symbol_repo)
     index_file(graph_engine, repo_id, symbol_repo / "caller.py", repo_root=symbol_repo)
@@ -207,7 +212,7 @@ def test_a_rename_with_an_edit_in_a_blobless_clone_lists_both_paths_without_fetc
     script.chmod(0o755)
     _run_git(dst, "remote", "set-url", "origin", "ssh://git.example.invalid/repo.git")
     _run_git(dst, "config", "core.sshCommand", str(script))
-    record = registry.add_repo(dst, repo_id="_smoketest_impact_diff_partial")
+    record = registry.add_repo(dst, repo_id=f"_smoketest_impact_diff_partial_{_TOKEN}")
 
     result = impact_analysis_for_diff(_NoGraph(), registry, record.repo_id, "HEAD~1", "HEAD")
     assert "error" not in result, result
@@ -252,7 +257,7 @@ def _edit_both(root):
 def test_files_past_the_detail_cap_count_every_indexed_symbol(graph_engine, registry, two_files, monkeypatch):
     from devgraph.indexer.git_history import compare as git_compare
 
-    repo_id = "_smoketest_impact_diff_cap"
+    repo_id = f"_smoketest_impact_diff_cap_{_TOKEN}"
     _indexed(graph_engine, registry, two_files, repo_id, "a.py", "b.py", "caller.py")
     _edit_both(two_files)
     monkeypatch.setattr(git_compare, "_COMPARE_MAX_FILES", 1)
@@ -271,7 +276,7 @@ def test_files_past_the_detail_cap_count_every_indexed_symbol(graph_engine, regi
 def test_unreadable_symbols_count_every_indexed_symbol(graph_engine, registry, two_files, monkeypatch):
     from devgraph.indexer.git_history import compare as git_compare
 
-    repo_id = "_smoketest_impact_diff_unread"
+    repo_id = f"_smoketest_impact_diff_unread_{_TOKEN}"
     _indexed(graph_engine, registry, two_files, repo_id, "a.py", "b.py", "caller.py")
     _edit_both(two_files)
     monkeypatch.setattr(git_compare, "_COMPARE_MAX_FILE_BYTES", 5)
@@ -293,7 +298,7 @@ def test_a_failed_symbol_detail_counts_every_indexed_symbol(graph_engine, regist
     def fail(comparison):
         raise git_compare.CompareError("git object missing")
 
-    repo_id = "_smoketest_impact_diff_detail_fails"
+    repo_id = f"_smoketest_impact_diff_detail_fails_{_TOKEN}"
     _indexed(graph_engine, registry, two_files, repo_id, "a.py", "b.py", "caller.py")
     _edit_both(two_files)
     monkeypatch.setattr(git_compare, "symbol_detail", fail)
@@ -306,7 +311,7 @@ def test_a_failed_symbol_detail_counts_every_indexed_symbol(graph_engine, regist
 
 
 def test_a_pure_rename_traces_the_symbols_under_both_paths(graph_engine, registry, two_files):
-    repo_id = "_smoketest_impact_diff_rename"
+    repo_id = f"_smoketest_impact_diff_rename_{_TOKEN}"
     _indexed(graph_engine, registry, two_files, repo_id, "a.py", "b.py", "caller.py")
     _run_git(two_files, "mv", "a.py", "a2.py")
     _run_git(two_files, "commit", "-q", "-m", "rename")
@@ -321,7 +326,7 @@ def test_a_pure_rename_traces_the_symbols_under_both_paths(graph_engine, registr
 
 
 def test_symbols_the_index_lacks_are_named_in_a_notice(graph_engine, registry, two_files):
-    repo_id = "_smoketest_impact_diff_unindexed"
+    repo_id = f"_smoketest_impact_diff_unindexed_{_TOKEN}"
     registry.add_repo(two_files, repo_id=repo_id)
     _edit_both(two_files)
     try:
@@ -338,7 +343,7 @@ def test_symbols_the_index_lacks_are_named_in_a_notice(graph_engine, registry, t
 def test_a_merged_base_change_is_not_part_of_the_diff(graph_engine, registry, two_files):
     """main moves on after the branch point and is merged into the branch: only the
     branch's own change counts, from the merge base, as a pull request shows it."""
-    repo_id = "_smoketest_impact_diff_merge"
+    repo_id = f"_smoketest_impact_diff_merge_{_TOKEN}"
     _indexed(graph_engine, registry, two_files, repo_id, "a.py", "b.py", "caller.py")
     _run_git(two_files, "checkout", "-q", "-b", "feature")
     (two_files / "a.py").write_text("def fa():\n    return 2\n")

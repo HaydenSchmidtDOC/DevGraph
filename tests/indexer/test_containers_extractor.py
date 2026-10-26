@@ -273,12 +273,12 @@ networks:
         result = self.extractor.extract_from_compose_file(content)
         assert "build_context" not in result.services[0].properties
 
-    def test_build_context_at_repo_root_is_none(self):
-        """build: . (repo root) has no meaningful subdirectory to attribute
-        files to, so build_context should be absent."""
+    def test_build_context_at_repo_root_is_the_root(self):
+        """build: . beside a root compose file is the repository root (""),
+        which owns every file no deeper context claims."""
         content = "services:\n  api:\n    build: .\n"
         result = self.extractor.extract_from_compose_file(content)
-        assert "build_context" not in result.services[0].properties
+        assert result.services[0].properties["build_context"] == ""
 
 
 def test_compose_file_that_yaml_cannot_construct_is_skipped():

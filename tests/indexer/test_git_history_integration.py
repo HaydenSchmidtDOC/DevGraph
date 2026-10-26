@@ -4,6 +4,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,10 @@ import pytest
 from devgraph.graph.engine import GraphEngine
 from devgraph.indexer.git_history.extractor import index_repo_history, sync_git_history
 from devgraph.registry.store import RepoRegistry
+
+# Unique per run, so sessions sharing the Neo4j never seed or delete each
+# other's repositories; tests/conftest.py sweeps any a teardown leaves.
+_TOKEN = uuid.uuid4().hex[:8]
 
 
 def _run_git(repo_path: Path, *args: str) -> None:
@@ -51,7 +56,7 @@ def registry():
 
 
 def test_index_repo_history_end_to_end(graph_engine, temp_git_repo, registry):
-    repo_id = "_smoketest_git_history"
+    repo_id = f"_smoketest_git_history_{_TOKEN}"
     record = registry.add_repo(temp_git_repo, repo_id=repo_id)
     graph_engine.upsert_node("Module", record.repo_id, "service.py", {})
 
@@ -98,7 +103,7 @@ def test_modifies_edge_resolves_for_nested_file(graph_engine, registry):
     """
     from devgraph.indexer.python.extractor import index_file
 
-    repo_id = "_smoketest_git_history_nested"
+    repo_id = f"_smoketest_git_history_nested_{_TOKEN}"
     with tempfile.TemporaryDirectory() as tmpdir:
         repo_path = Path(tmpdir)
         _run_git(repo_path, "init")
@@ -138,7 +143,7 @@ def test_reindex_preserves_modifies_edges(graph_engine, registry):
     """
     from devgraph.indexer.python.extractor import index_file
 
-    repo_id = "_smoketest_git_history_reindex_preserves"
+    repo_id = f"_smoketest_git_history_reindex_preserves_{_TOKEN}"
     with tempfile.TemporaryDirectory() as tmpdir:
         repo_path = Path(tmpdir)
         _run_git(repo_path, "init")
@@ -177,7 +182,7 @@ def test_reindex_preserves_modifies_edges(graph_engine, registry):
 
 
 def test_sync_git_history_initial_walk_stages_module_recency(graph_engine, temp_git_repo, registry):
-    repo_id = "_smoketest_sync_initial"
+    repo_id = f"_smoketest_sync_initial_{_TOKEN}"
     record = registry.add_repo(temp_git_repo, repo_id=repo_id)
     graph_engine.upsert_node("Module", record.repo_id, "service.py", {})
 
@@ -202,7 +207,7 @@ def test_sync_git_history_initial_walk_stages_module_recency(graph_engine, temp_
 
 
 def test_sync_git_history_fast_path_advances_recency(graph_engine, temp_git_repo, registry):
-    repo_id = "_smoketest_sync_fast"
+    repo_id = f"_smoketest_sync_fast_{_TOKEN}"
     record = registry.add_repo(temp_git_repo, repo_id=repo_id)
     graph_engine.upsert_node("Module", record.repo_id, "service.py", {})
 
@@ -229,7 +234,7 @@ def test_sync_git_history_fast_path_advances_recency(graph_engine, temp_git_repo
 def test_sync_git_history_reconcile_deletes_orphans_and_resets_recency(
     graph_engine, temp_git_repo, registry
 ):
-    repo_id = "_smoketest_sync_reconcile"
+    repo_id = f"_smoketest_sync_reconcile_{_TOKEN}"
     record = registry.add_repo(temp_git_repo, repo_id=repo_id)
     graph_engine.upsert_node("Module", record.repo_id, "service.py", {})
 
@@ -273,7 +278,7 @@ def test_sync_git_history_force_resyncs_even_when_head_unchanged(graph_engine, t
     """
     from devgraph.indexer.python.extractor import index_file
 
-    repo_id = "_smoketest_sync_force"
+    repo_id = f"_smoketest_sync_force_{_TOKEN}"
     record = registry.add_repo(temp_git_repo, repo_id=repo_id)
     py_file = temp_git_repo / "service.py"
 
@@ -315,6 +320,32 @@ def test_sync_git_history_force_resyncs_even_when_head_unchanged(graph_engine, t
         graph_engine.delete_repository(record.repo_id)
 
 
+def test_sync_git_history_restores_history_after_the_graph_is_wiped(graph_engine, temp_git_repo, registry):
+    """A wiped or replaced graph no longer holds the commit the registry
+    recorded; the next sync must read history again, not report a noop."""
+    repo_id = "_smoketest_sync_wiped"
+    record = registry.add_repo(temp_git_repo, repo_id=repo_id)
+    graph_engine.upsert_node("Module", record.repo_id, "service.py", {})
+
+    try:
+        sync_git_history(graph_engine, registry, record.repo_id)
+
+        # The wipe: the graph loses everything, the registry keeps its HEAD.
+        graph_engine.delete_repository(record.repo_id)
+        graph_engine.upsert_node("Module", record.repo_id, "service.py", {})
+
+        outcome = sync_git_history(graph_engine, registry, record.repo_id)
+        assert outcome["mode"] == "initial"
+        result = graph_engine.run_cypher(
+            "MATCH (c:Commit {repo_id: $repo_id})-[:MODIFIES]->(m:Module {name: 'service.py'}) "
+            "RETURN COUNT(*) as count",
+            {"repo_id": record.repo_id},
+        )
+        assert result[0]["count"] == 1
+    finally:
+        graph_engine.delete_repository(record.repo_id)
+
+
 def test_sync_git_history_unknown_repo_raises(graph_engine, registry):
     with pytest.raises(ValueError):
         sync_git_history(graph_engine, registry, "nonexistent")
@@ -327,7 +358,7 @@ def test_recency_never_creates_a_node_for_a_file_the_graph_does_not_hold(graph_e
     (temp_git_repo / "README.md").write_text("# Demo\n")
     _run_git(temp_git_repo, "add", "README.md")
     _run_git(temp_git_repo, "commit", "-m", "Add a readme")
-    record = registry.add_repo(temp_git_repo, repo_id="_smoketest_sync_no_stray")
+    record = registry.add_repo(temp_git_repo, repo_id=f"_smoketest_sync_no_stray_{_TOKEN}")
     graph_engine.upsert_node("Module", record.repo_id, "service.py", {})
 
     try:
@@ -394,7 +425,7 @@ def test_sync_git_history_never_lazy_fetches_in_a_partial_clone(graph_engine, re
     _run_git(dst, "remote", "set-url", "origin", "ssh://git.example.invalid/repo.git")
     _run_git(dst, "config", "core.sshCommand", str(script))
 
-    record = registry.add_repo(dst, repo_id=f"_smoketest_sync_partial_{filter_spec.replace(':', '_')}")
+    record = registry.add_repo(dst, repo_id=f"_smoketest_sync_partial_{filter_spec.replace(':', '_')}_{_TOKEN}")
     graph_engine.upsert_node("Module", record.repo_id, "a.py", {})
     graph_engine.upsert_node("Function", record.repo_id, "a", {"file": "a.py", "start_line": 1, "end_line": 2})
     graph_engine.upsert_node("Module", record.repo_id, "b.py", {})
@@ -462,7 +493,7 @@ def test_deepening_a_shallow_clone_corrects_its_history(graph_engine, registry, 
     _run_git(origin, "commit", "-am", "Edit a")
     clone = tmp_path / "clone"
     subprocess.run(["git", "clone", "--quiet", "--depth=1", f"file://{origin}", str(clone)], check=True)
-    record = registry.add_repo(clone, repo_id="_shallow_deepen_test")
+    record = registry.add_repo(clone, repo_id=f"_smoketest_shallow_deepen_{_TOKEN}")
     for name in ("a", "b", "c", "d"):
         graph_engine.upsert_node("Module", record.repo_id, f"{name}.py", {})
 
@@ -505,7 +536,7 @@ def test_same_named_methods_of_one_file_each_get_their_own_recency(graph_engine,
         "class A:\n    def act(self):\n        return 1\n\n\nclass B:\n    def act(self):\n        return 2\n"
     )
     _run_git(root, "commit", "-am", "Add B", "--date", "2021-01-01T00:00:00+00:00")
-    record = registry.add_repo(root, repo_id="_smoketest_sync_owner")
+    record = registry.add_repo(root, repo_id=f"_smoketest_sync_owner_{_TOKEN}")
 
     def recency():
         rows = graph_engine.run_cypher(

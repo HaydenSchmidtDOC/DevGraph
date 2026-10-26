@@ -1,6 +1,7 @@
 """Live round trip of graph insights through Neo4j. Skips without Neo4j."""
 
 import json
+import uuid
 
 import pytest
 
@@ -13,7 +14,11 @@ from devgraph.analytics.insights import (
 )
 from devgraph.graph.engine import GraphEngine
 
-REPO = "_smoketest_graph_insights"
+# Unique per run, so sessions sharing the Neo4j never seed or delete each
+# other's repositories; tests/conftest.py sweeps any a teardown leaves.
+_TOKEN = uuid.uuid4().hex[:8]
+
+REPO = f"_smoketest_graph_insights_{_TOKEN}"
 
 
 @pytest.fixture

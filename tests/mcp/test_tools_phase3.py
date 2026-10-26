@@ -2,11 +2,18 @@
 issue_history_for.
 """
 
+import uuid
+
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
 from devgraph.graph.engine import GraphEngine
 from devgraph.mcp.tools import blame_component, find_related_prs, issue_history_for
+
+# Unique per run, so sessions sharing the Neo4j never seed or delete each
+# other's repositories; tests/conftest.py sweeps any a teardown leaves.
+_TOKEN = uuid.uuid4().hex[:8]
+REPO_A, REPO_B = f"test_repo_a_{_TOKEN}", f"test_repo_b_{_TOKEN}"
 
 
 @pytest.fixture
@@ -23,79 +30,79 @@ def engine():
 
 @pytest.fixture
 def seeded_graph(engine):
-    engine.upsert_repository("test_repo_a", "Test Repo A", "/path/to/repo_a")
-    engine.upsert_node("Module", "test_repo_a", "auth.py")
+    engine.upsert_repository(REPO_A, "Test Repo A", "/path/to/repo_a")
+    engine.upsert_node("Module", REPO_A, "auth.py")
     engine.upsert_node(
         "Commit",
-        "test_repo_a",
+        REPO_A,
         "sha1",
         {"message": "Add auth", "author": "Alice", "authored_date": "2026-01-01T00:00:00"},
     )
     engine.upsert_node(
         "Commit",
-        "test_repo_a",
+        REPO_A,
         "sha2",
         {"message": "Fix auth bug", "author": "Bob", "authored_date": "2026-01-02T00:00:00"},
     )
-    engine.upsert_node("Issue", "test_repo_a", "42", {"title": "Auth bug", "state": "closed", "url": "http://x/42"})
+    engine.upsert_node("Issue", REPO_A, "42", {"title": "Auth bug", "state": "closed", "url": "http://x/42"})
     engine.upsert_node(
-        "PullRequest", "test_repo_a", "7", {"title": "Fix auth bug", "state": "closed", "url": "http://x/pr7"}
+        "PullRequest", REPO_A, "7", {"title": "Fix auth bug", "state": "closed", "url": "http://x/pr7"}
     )
 
-    engine.upsert_relationship("Commit", "sha1", "MODIFIES", "Module", "auth.py", "test_repo_a")
-    engine.upsert_relationship("Commit", "sha2", "MODIFIES", "Module", "auth.py", "test_repo_a")
-    engine.upsert_relationship("Commit", "sha2", "REFERENCES", "Issue", "42", "test_repo_a")
-    engine.upsert_relationship("PullRequest", "7", "RESOLVES", "Issue", "42", "test_repo_a")
+    engine.upsert_relationship("Commit", "sha1", "MODIFIES", "Module", "auth.py", REPO_A)
+    engine.upsert_relationship("Commit", "sha2", "MODIFIES", "Module", "auth.py", REPO_A)
+    engine.upsert_relationship("Commit", "sha2", "REFERENCES", "Issue", "42", REPO_A)
+    engine.upsert_relationship("PullRequest", "7", "RESOLVES", "Issue", "42", REPO_A)
 
     # Repo B: isolation check
-    engine.upsert_repository("test_repo_b", "Test Repo B", "/path/to/repo_b")
-    engine.upsert_node("Module", "test_repo_b", "auth.py")
-    engine.upsert_node("Commit", "test_repo_b", "sha_b", {"message": "Repo B commit", "author": "Carl", "authored_date": "2026-01-03T00:00:00"})
-    engine.upsert_relationship("Commit", "sha_b", "MODIFIES", "Module", "auth.py", "test_repo_b")
+    engine.upsert_repository(REPO_B, "Test Repo B", "/path/to/repo_b")
+    engine.upsert_node("Module", REPO_B, "auth.py")
+    engine.upsert_node("Commit", REPO_B, "sha_b", {"message": "Repo B commit", "author": "Carl", "authored_date": "2026-01-03T00:00:00"})
+    engine.upsert_relationship("Commit", "sha_b", "MODIFIES", "Module", "auth.py", REPO_B)
 
     yield engine
 
-    engine.delete_repository("test_repo_a")
-    engine.delete_repository("test_repo_b")
+    engine.delete_repository(REPO_A)
+    engine.delete_repository(REPO_B)
 
 
 class TestBlameComponent:
     def test_blame_returns_commits_most_recent_first(self, seeded_graph):
-        result = blame_component(seeded_graph, "test_repo_a", "auth.py")
+        result = blame_component(seeded_graph, REPO_A, "auth.py")
         shas = [r["sha"] for r in result["results"]]
         assert shas == ["sha2", "sha1"]
 
     def test_blame_no_cross_repo_leakage(self, seeded_graph):
-        result = blame_component(seeded_graph, "test_repo_a", "auth.py")
+        result = blame_component(seeded_graph, REPO_A, "auth.py")
         assert all(r["sha"] != "sha_b" for r in result["results"])
 
     def test_blame_cross_repo_opt_in(self, seeded_graph):
-        result = blame_component(seeded_graph, "test_repo_a", "auth.py", cross_repo=True)
+        result = blame_component(seeded_graph, REPO_A, "auth.py", cross_repo=True)
         shas = {r["sha"] for r in result["results"]}
         assert "sha_b" in shas
 
     def test_blame_an_unknown_file_is_not_found(self, seeded_graph):
         """Like the other tools: an empty list read as "no commits touched it"."""
-        with pytest.raises(ToolError, match=r"no file named 'auth' in repository 'test_repo_a'.*name='auth\.py'"):
-            blame_component(seeded_graph, "test_repo_a", "auth")
+        with pytest.raises(ToolError, match=rf"no file named 'auth' in repository '{REPO_A}'.*name='auth\.py'"):
+            blame_component(seeded_graph, REPO_A, "auth")
         with pytest.raises(ToolError, match="no file named 'nowhere.py' in any repository"):
-            blame_component(seeded_graph, "test_repo_a", "nowhere.py", cross_repo=True)
+            blame_component(seeded_graph, REPO_A, "nowhere.py", cross_repo=True)
 
     def test_blame_a_file_no_commit_touched_is_empty(self, seeded_graph):
-        seeded_graph.upsert_node("Module", "test_repo_a", "untouched.py")
-        assert blame_component(seeded_graph, "test_repo_a", "untouched.py") == {"count": 0, "results": [], "truncated": False}
+        seeded_graph.upsert_node("Module", REPO_A, "untouched.py")
+        assert blame_component(seeded_graph, REPO_A, "untouched.py") == {"count": 0, "results": [], "truncated": False}
 
 
 class TestFindRelatedPrs:
     def test_find_related_prs_basic(self, seeded_graph):
-        result = find_related_prs(seeded_graph, "test_repo_a", "auth.py")
+        result = find_related_prs(seeded_graph, REPO_A, "auth.py")
         assert "results" in result and "count" in result and "truncated" in result
         numbers = {r["number"] for r in result["results"]}
         assert "7" in numbers
 
     def test_find_related_prs_truncation(self, seeded_graph):
         """Test that truncated flag is set when total count exceeds max_results."""
-        result = find_related_prs(seeded_graph, "test_repo_a", "auth.py", max_results=1)
+        result = find_related_prs(seeded_graph, REPO_A, "auth.py", max_results=1)
         assert "truncated" in result
         assert "count" in result
         # If count > max_results (1), truncated should be True
@@ -106,18 +113,18 @@ class TestFindRelatedPrs:
 
 class TestIssueHistoryFor:
     def test_issue_history_basic(self, seeded_graph):
-        result = issue_history_for(seeded_graph, "test_repo_a", "auth.py")
+        result = issue_history_for(seeded_graph, REPO_A, "auth.py")
         assert "results" in result and "count" in result and "truncated" in result
         numbers = {r["number"] for r in result["results"]}
         assert "42" in numbers
 
     def test_issue_history_no_leakage(self, seeded_graph):
-        result = issue_history_for(seeded_graph, "test_repo_b", "auth.py")
+        result = issue_history_for(seeded_graph, REPO_B, "auth.py")
         assert result["results"] == []
 
     def test_issue_history_truncation(self, seeded_graph):
         """Test that truncated flag is set when total count exceeds max_results."""
-        result = issue_history_for(seeded_graph, "test_repo_a", "auth.py", max_results=1)
+        result = issue_history_for(seeded_graph, REPO_A, "auth.py", max_results=1)
         assert "truncated" in result
         assert "count" in result
         # If count > max_results (1), truncated should be True

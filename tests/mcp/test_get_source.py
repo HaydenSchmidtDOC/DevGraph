@@ -3,6 +3,7 @@ text off disk using the graph's last-indexed line range, plus docstring_full.
 """
 
 import tempfile
+import uuid
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,10 @@ from devgraph.indexer.dispatch import index_paths
 from devgraph.indexer.python.extractor import index_file
 from devgraph.mcp.tools import get_source
 from devgraph.registry.store import RepoRegistry
+
+# Unique per run, so sessions sharing the Neo4j never seed or delete each
+# other's repositories; tests/conftest.py sweeps any a teardown leaves.
+_TOKEN = uuid.uuid4().hex[:8]
 
 
 @pytest.fixture
@@ -48,7 +53,7 @@ def repo_with_indexed_file(engine):
 
         with tempfile.TemporaryDirectory() as regdir:
             registry = RepoRegistry(Path(regdir) / "registry.db")
-            record = registry.add_repo(repo_root, repo_id="_smoketest_get_source")
+            record = registry.add_repo(repo_root, repo_id=f"_smoketest_get_source_{_TOKEN}")
             engine.upsert_repository(record.repo_id, record.repo_id, str(record.path))
             index_file(engine, record.repo_id, source_file, repo_root=repo_root)
 
@@ -107,7 +112,7 @@ def repo_with_sibling(engine):
 
         with tempfile.TemporaryDirectory() as regdir:
             registry = RepoRegistry(Path(regdir) / "registry.db")
-            record = registry.add_repo(repo_root, repo_id="_smoketest_get_source_sibling")
+            record = registry.add_repo(repo_root, repo_id=f"_smoketest_get_source_sibling_{_TOKEN}")
             engine.upsert_repository(record.repo_id, record.repo_id, str(record.path))
             try:
                 yield engine, registry, record.repo_id
@@ -148,7 +153,7 @@ def two_helpers(engine):
             )
         (repo_root / "t.py").write_text("def target():\n    return 1\n", encoding="utf-8")
         registry = RepoRegistry(Path(regdir) / "registry.db")
-        record = registry.add_repo(repo_root, repo_id="_smoketest_get_source_two")
+        record = registry.add_repo(repo_root, repo_id=f"_smoketest_get_source_two_{_TOKEN}")
         engine.delete_repository(record.repo_id)
         engine.upsert_repository(record.repo_id, record.repo_id, str(record.path))
         for name in ("t.py", "a.py", "b.py"):

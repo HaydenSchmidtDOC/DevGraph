@@ -252,8 +252,8 @@ def test_a_jsx_component_is_a_call_of_it():
 def test_jsx_in_a_callback_or_render_prop_renders_from_the_enclosing_function():
     """An element inside an anonymous arrow (a list callback, an inline
     render prop, a nested one) renders from the named function holding it,
-    unless its tag is a callback's parameter; calls there stay unattributed,
-    and a named arrow's elements are its own."""
+    unless its tag is a callback's parameter, as calls there do
+    (test_jsts_callback_calls.py), and a named arrow's elements are its own."""
     source = """
         import { Row, Empty, Panel, format } from './ui';
 
@@ -270,8 +270,8 @@ def test_jsx_in_a_callback_or_render_prop_renders_from_the_enclosing_function():
     """
     found = calls(source, "src/List.tsx")
     names = {n for c, n, _f, _conf in found if c == "List"}
-    assert {"Row", "Empty", "Panel"} <= names
-    assert "Comp" not in names and "format" not in names
+    assert {"Row", "Empty", "Panel", "format"} <= names
+    assert "Comp" not in names
     assert {n for c, n, _f, _conf in found if c == "Item"} >= {"Empty"}
 
 

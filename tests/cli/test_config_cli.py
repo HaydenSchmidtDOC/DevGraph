@@ -578,3 +578,19 @@ def test_show_text_tables_have_a_colour_column(runner, settings, tmp_path):
     assert result.exit_code == 0, result.output
     assert result.output.count("Colour") == 2
     assert "#1f77b4" in result.output
+
+
+def test_the_config_scope_finds_a_repo_typed_in_another_case_on_macos(tmp_path, monkeypatch):
+    """macOS ignores case and its resolve() keeps the case typed: .../shop/src
+    lies in the repository registered as .../Shop, and .../shop is its record."""
+    from types import SimpleNamespace
+
+    from devgraph import paths
+
+    shop = SimpleNamespace(repo_id="shop", path=str(tmp_path / "Shop"), active=True)
+    monkeypatch.setattr(cli_main, "_registered_repos", lambda: [shop])
+    monkeypatch.setattr(paths, "sys", SimpleNamespace(platform="darwin"))
+    monkeypatch.setattr(paths.os.path, "samefile", lambda a, b: str(a).casefold() == str(b).casefold())
+    assert cli_main._containing_repo([shop], tmp_path / "shop" / "src") is shop
+    assert cli_main._scope_record(tmp_path / "shop") is shop
+    assert cli_main._containing_repo([shop], tmp_path / "shopping") is None

@@ -14,7 +14,6 @@ from devgraph.indexer.schema_constraints import constraint_drift, generated_obje
 from tests.helpers import stub
 from tests.indexer.docs_live_helpers import assert_matches_fresh_apply
 
-REPO = "_smoketest_schema_apply"
 WORKTREE = """
     version: 1
     node_types:
@@ -36,6 +35,7 @@ WORKTREE = """
 # Unique per run: these tests drop and re-create the labels' generated
 # constraints, which are database-wide and shared with real repositories.
 _TOKEN = uuid.uuid4().hex[:8]
+REPO = f"_smoketest_schema_apply_{_TOKEN}"
 FILE, FOLDER, ENTRY = (f"ZzFile{_TOKEN}", f"ZzFolder{_TOKEN}", f"ZzEntry{_TOKEN}")
 GADGET = f"ZzGadget{_TOKEN}"
 NOTE = f"ZzNote{_TOKEN}"
