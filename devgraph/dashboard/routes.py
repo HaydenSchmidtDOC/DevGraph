@@ -102,6 +102,12 @@ _CANVAS_NODE_PROPERTIES = ("name", "repo_id", "file", "owner", "insight_communit
 # at most what the in-memory ring buffer holds (one hour).
 _HISTORY_SECONDS_MIN = 60
 _HISTORY_SECONDS_MAX = 3600
+# `/query-rate` bounds. A GET needs no cross-site check, so any web page can
+# ask for one; one bucket is allocated per `interval` of `span`. The span is
+# capped at the chart's longest option (a week) and the interval raised so
+# there are never more than this many buckets.
+_QUERY_RATE_SPAN_MAX = 7 * 86400
+_QUERY_RATE_MAX_BUCKETS = 1440
 # One config entry's YAML is a few hundred bytes; 64 KiB leaves room for long
 # Cypher while keeping a hostile body from being buffered or parsed.
 _CONFIG_PAYLOAD_LIMIT_BYTES = 64 * 1024
@@ -873,7 +879,9 @@ def build_router(
 
     @router.get("/query-rate")
     def get_query_rate(span: int = 3600, interval: int = 60) -> dict[str, Any]:
-        return {"buckets": query_log.rate(max(1, span), max(1, interval))}
+        span = max(1, min(span, _QUERY_RATE_SPAN_MAX))
+        interval = max(1, interval, -(-span // _QUERY_RATE_MAX_BUCKETS))
+        return {"buckets": query_log.rate(span, interval)}
 
     def _config_scope(scope: str) -> dict[str, Any]:
         """One Config page block: the global store (`__global__`) or one active registered repo."""

@@ -111,12 +111,12 @@ def search_components(
     to the built-in set; the caller must take them from the applied schema
     (never from user input) since a label cannot be parameterized.
     """
-    from devgraph.mcp.tools import _SEARCH_LABELS, _name_variants, ranked_search
+    from devgraph.mcp.tools import _SEARCH_LABELS, SEARCH_MAX_RESULTS, _name_variants, ranked_search
 
     terms = [query.lower()]
     labels = _SEARCH_LABELS + tuple(label for label in project_labels or [] if label not in _SEARCH_LABELS)
     rows, _count, _lower_bound = ranked_search(
-        engine, labels, terms, _name_variants(query, terms), max(1, max_results), repo_id=repo_id,
+        engine, labels, terms, _name_variants(query, terms), max(1, min(max_results, SEARCH_MAX_RESULTS)), repo_id=repo_id,
         query=query,
     )
     return [
