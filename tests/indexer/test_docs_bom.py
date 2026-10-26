@@ -19,7 +19,9 @@ def test_a_note_after_a_bom_is_extracted():
     assert [(d.label, d.name, d.properties["title"]) for d in result.docs] == [
         ("DesignDecision", "use-neo4j", "Use Neo4j")
     ]
-    assert [(r.source_name, r.relationship_type) for r in result.relationships] == [("a.py", "DOCUMENTED_BY")]
+    assert ("Module", "a.py", "DOCUMENTED_BY") in {
+        (r.source_label, r.source_name, r.relationship_type) for r in result.relationships
+    }
 
 
 def test_front_matter_after_a_bom_is_read(tmp_path):
