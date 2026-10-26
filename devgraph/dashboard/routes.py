@@ -64,8 +64,8 @@ from devgraph.dashboard.query_log import QueryLog
 from devgraph.graph.engine import (
     EngineClosed,
     GraphEngine,
-    clear_leftover_graph_data,
     identity_key,
+    ids_held_for_other_paths,
     provision_repository_schema,
 )
 from devgraph.graph.schema import (
@@ -77,7 +77,7 @@ from devgraph.graph.schema import (
 from devgraph.indexer.dispatch import full_scan, full_scan_running
 from devgraph.indexer.walk import repo_root_problem
 from devgraph.mcp import tools as devgraph_tools
-from devgraph.registry.store import RepoRegistry
+from devgraph.registry.store import RepoRegistry, wanted_repo_id
 from devgraph.watcher.manager import is_partly_watched
 
 logger = logging.getLogger(__name__)
@@ -400,7 +400,14 @@ def build_router(
         dashboard is watching while this runs.
         """
         try:
-            record = registry.add_repo(path, repo_id)
+            # Never an id the graph holds another repository's data under
+            # (`ids_held_for_other_paths`); with Neo4j down nothing can be
+            # checked here, and the first scan checks (`foreign_graph_data`).
+            taken = ids_held_for_other_paths(engine, Path(path).resolve())
+        except Exception:
+            taken = set()
+        try:
+            record = registry.add_repo(path, repo_id, taken=taken)
         except ValueError as exc:
             # add_repo's own message names the actual problem (missing path,
             # not a git repo, already registered) and contains nothing the
@@ -409,14 +416,16 @@ def build_router(
         except Exception as exc:
             logger.exception("repo registration failed for %s", path)
             raise HTTPException(status_code=500, detail="registration failed") from exc
+        wanted = wanted_repo_id(path, repo_id)
+        if record.repo_id != wanted and wanted in taken:
+            logger.info("registered %s as %s: the graph holds another repository's data under %s, left in place",
+                        record.path, record.repo_id, wanted)
 
         indexed = False
         files_indexed: int | None = None
         warning: str | None = None
         try:
             provision_repository_schema(engine, record.path)
-            if clear_leftover_graph_data(engine, record.repo_id):
-                logger.info("deleted graph data an earlier repository left under %s", record.repo_id)
             engine.upsert_repository(record.repo_id, record.repo_id, str(record.path))
 
             def scan_and_stamp() -> int:

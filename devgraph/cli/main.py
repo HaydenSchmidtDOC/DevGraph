@@ -34,13 +34,18 @@ from devgraph.config.edits import removed_types as _removed_types  # noqa: F401 
 from devgraph.config.schema_findings import project_schema_findings as _project_schema_findings
 from devgraph.dashboard import queries as dashboard_queries
 from devgraph.dashboard.url import dashboard_url, probe_dashboard
-from devgraph.graph.engine import GraphEngine, clear_leftover_graph_data, provision_repository_schema
+from devgraph.graph.engine import (
+    GraphEngine,
+    foreign_graph_data,
+    ids_held_for_other_paths,
+    provision_repository_schema,
+)
 from devgraph.indexer.dispatch import full_scan, full_scan_elsewhere
 from devgraph.indexer.docs.extractor import index_file as index_doc_file
 from devgraph.indexer.git_history.extractor import sync_git_history
 from devgraph.indexer.walk import TOO_LARGE, RepoRootUnavailable, check_repo_root, repo_root_problem
 from devgraph.paths import is_within, is_within_directory, read_bounded, same_directory
-from devgraph.registry.store import RepoRegistry
+from devgraph.registry.store import RepoRegistry, wanted_repo_id
 
 app = typer.Typer(help="DevGraph: local-first developer knowledge graph")
 
@@ -126,22 +131,25 @@ def add(
             if existing is not None:
                 console.print(f"[green][OK][/green] Already registered: {escape(existing.repo_id)} at {escape(str(existing.path))}")
                 return
-            record = registry.add_repo(path)
+            settings = get_settings()
+            taken = _ids_held_for_other_paths(settings, resolved)
+            record = registry.add_repo(path, taken=taken)
             console.print(
                 f"[green][OK][/green] Registered: {escape(record.repo_id)} at {escape(str(record.path))}"
             )
+            wanted = wanted_repo_id(path)
+            if record.repo_id != wanted and wanted in taken:
+                console.print(
+                    f"[yellow]The graph already holds another repository's data under {escape(wanted)}[/yellow], "
+                    f"so this one is {escape(record.repo_id)}. That data is left in place: if no other DevGraph "
+                    "install on this Neo4j uses it, 'devgraph prune' deletes it.",
+                    soft_wrap=True,
+                )
 
             try:
-                settings = get_settings()
                 engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
                 try:
                     provision_repository_schema(engine, record.path)
-                    if clear_leftover_graph_data(engine, record.repo_id):
-                        console.print(
-                            f"[yellow]Deleted graph data an earlier repository left under {escape(record.repo_id)}[/yellow] "
-                            "(unregistered with its graph data kept)",
-                            soft_wrap=True,
-                        )
                     engine.upsert_repository(record.repo_id, record.repo_id, str(record.path))
                     started = datetime.now(timezone.utc)
                     skipped: dict[str, str] = {}
@@ -184,6 +192,21 @@ def add(
     except Exception as e:
         console.print(f"[red][X] Unexpected error:[/red] {escape(str(e))}")
         raise typer.Exit(code=1)
+
+
+def _ids_held_for_other_paths(settings: Any, path: Path) -> set[str]:
+    """The ids registering `path` must skip (`ids_held_for_other_paths`); none
+    when Neo4j can't be asked, and the first rescan or index checks instead
+    (`foreign_graph_data`)."""
+    engine = None
+    try:
+        engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
+        return ids_held_for_other_paths(engine, path)
+    except Exception:
+        return set()
+    finally:
+        if engine is not None:
+            engine.close()
 
 
 #: How many skipped files `_print_skipped` names before summarising the rest.
@@ -391,6 +414,12 @@ def rescan(
             settings = get_settings()
             engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
             try:
+                # Registered while Neo4j was down, so its id was never checked
+                # against the graph: never merge into another repository's data.
+                problem = None if repo.last_indexed else foreign_graph_data(engine, repo_id, repo.path)
+                if problem:
+                    console.print(f"[red][X] Error:[/red] {escape(problem)}", soft_wrap=True)
+                    raise typer.Exit(code=1)
                 provision_repository_schema(engine, repo.path)
                 engine.upsert_repository(repo_id, repo_id, str(repo.path))
                 holder = full_scan_elsewhere(engine, repo_id)

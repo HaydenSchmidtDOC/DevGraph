@@ -2777,6 +2777,29 @@ class GraphEngine:
             )
             return {record["repo_id"] for record in result or []}
 
+    def graph_repo_paths(self) -> dict[str, str | None]:
+        """`graph_repo_ids` with each id's Repository node path (None when it has no Repository node)."""
+        with self._driver.session() as session:
+            result = _run_records(
+                session,
+                "MATCH (n) WHERE n.repo_id IS NOT NULL WITH DISTINCT n.repo_id AS repo_id "
+                "OPTIONAL MATCH (r:Repository {repo_id: repo_id}) RETURN repo_id, r.path AS path",
+            )
+            return {record["repo_id"]: record["path"] for record in result or []}
+
+    def repository_owner(self, repo_id: str) -> tuple[bool, str | None]:
+        """Whether any node carries `repo_id`, and its Repository node's path
+        (None when it has none). The Repository lookup is indexed; only an id
+        without one scans for other nodes."""
+        with self._driver.session() as session:
+            rows = _run_records(
+                session, "MATCH (r:Repository {repo_id: $repo_id}) RETURN r.path AS path LIMIT 1", repo_id=repo_id
+            )
+            if rows:
+                return True, rows[0]["path"]
+            rows = _run_records(session, "MATCH (n) WHERE n.repo_id = $repo_id RETURN 1 AS one LIMIT 1", repo_id=repo_id)
+            return bool(rows), None
+
     def repo_node_counts(self, repo_ids: Iterable[str]) -> dict[str, int]:
         """How many nodes carry each of these repo_ids; an id no node carries is left out."""
         with self._driver.session() as session:
@@ -3006,23 +3029,39 @@ def _graph_shaped(result: Any, max_rows: int | None = None) -> dict[str, Any]:
     return {"columns": columns, "data": data, "truncated": truncated}
 
 
-def clear_leftover_graph_data(engine: GraphEngine, repo_id: str) -> bool:
-    """Delete the graph data a repo id the registry has just issued already has.
+def ids_held_for_other_paths(engine: GraphEngine, repo_path: Path | str) -> set[str]:
+    """The repo ids the graph holds data under that registering `repo_path`
+    must not be issued: those whose Repository node names another path, and
+    those with nodes but no Repository node (whose owner can't be told).
 
-    Registration checks only the registry, so an id whose earlier repository
-    was unregistered with its data kept (`remove --keep-graph`, a lost or
-    reset registry) would otherwise hand that repository's nodes (its commits,
-    say) to the new one, where the initial scan never removes them and
-    `devgraph prune` no longer sees them. The registry owns nothing under the
-    id yet, so everything there is a leftover. Run after provisioning, so its
-    labels' constraints are not released here: one no repository declares any
-    more is reported by `devgraph doctor` and dropped by
-    `devgraph config schema prune-constraints`. True when anything was deleted.
+    An id whose Repository node names this same path is left out: its data is
+    this repository's (registered again, or the same layout on another
+    machine sharing the Neo4j), and registering adopts it. Nothing is ever
+    deleted: the data may be another DevGraph install's live repository.
     """
-    if not engine.repo_node_counts([repo_id]):
-        return False
-    engine.delete_repository(repo_id)
-    return True
+    path = str(repo_path)
+    return {repo_id for repo_id, owner in engine.graph_repo_paths().items() if owner != path}
+
+
+def foreign_graph_data(engine: GraphEngine, repo_id: str, repo_path: Path | str) -> str | None:
+    """Why `repo_id`'s first scan of `repo_path` must not run, else None.
+
+    Registration picks an id the graph holds no other repository's data
+    under, but it can't look while Neo4j is down; the first rescan or index
+    of a never-indexed repository checks instead. A scan would merge this
+    repository into the data there (another install's live repository, or one
+    unregistered with `remove --keep-graph`), and deleting it is not ours to
+    do, so the scan is refused with this message.
+    """
+    held, owner = engine.repository_owner(repo_id)
+    if not held or owner == str(repo_path):
+        return None
+    where = f"a repository at {owner}" if owner else "a repository whose Repository node is gone"
+    return (
+        f"the graph already holds data under {repo_id} from {where}, not {repo_path}; nothing was indexed. "
+        f"Run 'devgraph remove {repo_id} --keep-graph' and register the repository again: it gets a free id, "
+        "and the old data is left in place."
+    )
 
 
 def provision_repository_schema(engine: GraphEngine, repo_root: Path | str) -> None:

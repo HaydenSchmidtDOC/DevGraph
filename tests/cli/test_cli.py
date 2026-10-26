@@ -1007,8 +1007,8 @@ class _StubEngine:
     def upsert_repository(self, repo_id, name, path):
         self.calls.append("upsert_repository")
 
-    def repo_node_counts(self, repo_ids):
-        return {}
+    def repository_owner(self, repo_id):
+        return False, None  # the graph holds nothing under the id yet
 
     def full_scan_holder(self, repo_id, stale_s):
         return None
@@ -1177,7 +1177,7 @@ def test_cli_add_with_an_invalid_schema_keeps_the_repo_registered(
     collapsed = _collapsed(result.stdout)
     assert "Registered but initial scan failed" in collapsed
     assert "invalid project schema" in collapsed
-    assert engine.calls == ["close"]
+    assert set(engine.calls) == {"close"}  # registration's id check opens (and closes) an engine too
     assert scans == []
 
     verify = RepoRegistry(db_path)

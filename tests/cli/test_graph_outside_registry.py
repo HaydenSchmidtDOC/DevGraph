@@ -1,7 +1,7 @@
 """Graph data the registry doesn't own (audit 10, item 4).
 
-- A repo id reissued after `remove --keep-graph` starts empty: `add` and the
-  dashboard's register delete what an earlier repository left under it.
+- Registration never reuses an id another repository's graph data is under:
+  see tests/cli/test_reissued_repo_ids.py.
 - `prune` lists the ids it would delete, with node counts and a warning that
   another registry on the same Neo4j may own them, and deletes only with a
   confirmation at a terminal or `--yes`.
@@ -18,14 +18,11 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
-from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
 from devgraph import config as config_module
 from devgraph.cli import main as cli_main
 from devgraph.cli.main import app
-from devgraph.dashboard.app import build_app
-from devgraph.dashboard.events import EventBroadcaster
 from devgraph.graph.engine import GraphEngine
 from devgraph.registry.store import RepoRegistry
 
@@ -76,58 +73,6 @@ def _git_repo(parent: Path, name: str) -> Path:
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
     (repo / "app.py").write_text("def handler():\n    return 1\n", encoding="utf-8")
     return repo
-
-
-def _leave_old_commit(engine: GraphEngine, repo_id: str) -> None:
-    """What an earlier repository registered under `repo_id` and removed with
-    `--keep-graph` leaves behind."""
-    engine.upsert_repository(repo_id, repo_id, "/old/place")
-    engine.upsert_node("Commit", repo_id, "0ld5ecre7", {"message": "old secret project commit"})
-
-
-def _commits(engine: GraphEngine, repo_id: str) -> list[str]:
-    rows = engine.run_cypher("MATCH (c:Commit {repo_id: $r}) RETURN c.name AS name", {"r": repo_id})
-    return [row["name"] for row in rows]
-
-
-def test_add_deletes_what_an_earlier_repository_left_under_a_reissued_id(runner, settings, live_engine, tmp_path):
-    engine, ids = live_engine
-    repo_id = f"zz-a10c-reuse-{_TOKEN}"
-    ids.append(repo_id)
-    _leave_old_commit(engine, repo_id)
-
-    result = runner.invoke(app, ["add", str(_git_repo(tmp_path, repo_id))])
-
-    assert result.exit_code == 0, result.stdout
-    assert "earlier repository" in result.stdout
-    assert _commits(engine, repo_id) == []
-    rows = engine.run_cypher("MATCH (f:Function {repo_id: $r}) RETURN f.name AS name", {"r": repo_id})
-    assert [row["name"] for row in rows] == ["handler"]
-
-
-def test_dashboard_register_deletes_what_an_earlier_repository_left(live_engine, tmp_path):
-    engine, ids = live_engine
-    repo_id = f"zz-a10c-dash-reuse-{_TOKEN}"
-    ids.append(repo_id)
-    _leave_old_commit(engine, repo_id)
-    registry = RepoRegistry(tmp_path / "registry.db")
-    try:
-        client = TestClient(build_app(engine, registry, EventBroadcaster()), base_url="http://127.0.0.1")
-        res = client.post("/api/repos", json={"path": str(_git_repo(tmp_path, repo_id))})
-        assert res.status_code == 201, res.text
-        assert res.json()["repo_id"] == repo_id
-    finally:
-        registry.close()
-    assert _commits(engine, repo_id) == []
-
-
-def test_add_of_a_fresh_id_says_nothing_about_leftovers(runner, settings, live_engine, tmp_path):
-    engine, ids = live_engine
-    repo_id = f"zz-a10c-fresh-{_TOKEN}"
-    ids.append(repo_id)
-    result = runner.invoke(app, ["add", str(_git_repo(tmp_path, repo_id))])
-    assert result.exit_code == 0, result.stdout
-    assert "earlier repository" not in result.stdout
 
 
 def test_stats_without_a_repo_counts_only_registered_repositories(runner, settings, live_engine, tmp_path):
