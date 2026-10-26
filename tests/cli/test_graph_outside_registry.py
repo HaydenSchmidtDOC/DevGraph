@@ -180,3 +180,20 @@ def test_prune_yes_deletes_without_asking(runner, fake_prune):
     result = runner.invoke(app, ["prune", "--yes"])
     assert result.exit_code == 0, result.stdout
     assert fake_prune == ["zz-left-behind", "zz-other-install"]
+
+
+def test_prune_skips_an_id_registered_after_the_list_was_read(runner, settings, fake_prune, tmp_path, monkeypatch):
+    """A registration landing mid-prune (the dashboard, another `add`) keeps its data."""
+    def delete_then_register(self, repo_id):
+        _FakeEngine.deleted.append(repo_id)
+        registry = RepoRegistry(settings.registry_db_path)
+        try:
+            registry.add_repo(_git_repo(tmp_path, "checkout"), repo_id="zz-other-install")
+        finally:
+            registry.close()
+
+    monkeypatch.setattr(_FakeEngine, "delete_repository", delete_then_register)
+    result = runner.invoke(app, ["prune", "--yes"])
+    assert result.exit_code == 0, result.stdout
+    assert fake_prune == ["zz-left-behind"]
+    assert "Skipped zz-other-install" in _flat(result.stdout)

@@ -3740,6 +3740,16 @@ def prune(
                 raise typer.Exit(code=1)
 
         for rid in sorted(orphaned):
+            # Read again right before each delete: a registration since the
+            # list was read (the dashboard, another `devgraph add`) owns it now.
+            registry = _get_registry()
+            try:
+                registered_now = registry.get(rid) is not None
+            finally:
+                registry.close()
+            if registered_now:
+                console.print(f"[yellow]Skipped {escape(str(rid))}:[/yellow] registered since the list was read.")
+                continue
             recorded = engine.read_applied_schema(rid) or {}
             engine.delete_repository(rid)
             console.print(f"[green][OK][/green] Deleted: {escape(str(rid))}")
