@@ -347,10 +347,18 @@ def test_annotate_note_refuses_a_never_indexed_repo_over_another_paths_data(runn
     ids.append(name)
     _other_repository(engine, name, "/home/other-machine/elsewhere")
     repo = _git_repo(tmp_path, name)
-    (repo / "req.md").write_text("---\ntype: requirement\nid: REQ-1\ntitle: Mine\n---\nBody\n", encoding="utf-8")
+    (repo / "docs").mkdir()
+    (repo / "docs" / "req.md").write_text(
+        "---\ntype: requirement\nid: REQ-1\ntitle: Mine\n---\nBody\n", encoding="utf-8"
+    )
     _registered_while_neo4j_was_down(settings, repo)
+    registry = RepoRegistry(settings.registry_db_path)
+    try:
+        registry.set_docs_path(name, "docs")  # else the note is refused for being outside it
+    finally:
+        registry.close()
 
-    result = runner.invoke(app, ["annotate", name, "--note", "req.md"])
+    result = runner.invoke(app, ["annotate", name, "--note", "docs/req.md"])
 
     assert result.exit_code == 1
     assert "already holds data under" in " ".join(result.stdout.split())

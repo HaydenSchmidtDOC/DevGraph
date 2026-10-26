@@ -31,6 +31,8 @@ def _invoke(tmp_path, docs_path, args):
          patch.object(cli_main, "get_settings", return_value=settings), \
          patch.object(cli_main, "GraphEngine") as engine, \
          patch.object(cli_main, "index_doc_file") as index:
+        # A never-indexed repository's id holds no other repository's data.
+        engine.return_value.repository_owner.return_value = (False, None)
         result = CliRunner().invoke(app, ["annotate", repo_id, *args])
     return result, " ".join(result.stdout.split()), engine, index
 
