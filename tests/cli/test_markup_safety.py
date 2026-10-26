@@ -78,7 +78,8 @@ SAFE_EXPRESSIONS = {
     "count", "pid", "existing_pid", "started_pid", "node_count", "total_nodes", "total_rels",
     "marker", "liveness", "label", "verb", "word", "noun", "colour", "consequence", "origin", "what",
     "lifecycle.TRAY_START_TIMEOUT_S", "timeout_s", "elapsed", "waited", "restore_note", "CLAUDE_MCP_SCOPE",
-    "subject", "detail",  # escaped when assigned
+    "subject", "detail", "state",  # escaped when assigned
+    "_rescan_hint(repo)",  # fixed text
     "active_str", "watch_str", "*row",  # row: escaped when built
     "SCHEMA_FILENAME", "TOOLS_FILENAME", "_GLOBAL_TOOLS_NOTE", "obj.kind", "sys.version.split()[0]",
     "' '.join(MCP_SERVER_ARGS)", "finding['status']", "row['origin']",
