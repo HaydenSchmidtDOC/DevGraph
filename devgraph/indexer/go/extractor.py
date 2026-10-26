@@ -953,7 +953,10 @@ def _go_routes(
     for _pass in range(len(mount_calls)):
         settled: dict[tuple[int, int], tuple[str, str | None] | None] = {}
         for call, operand, (prefix, router) in mount_calls:
-            where = under(kind(operand, call), _go_literal(prefix, source))
+            mounter = kind(operand, call)
+            if mounter[0] == "none":
+                continue  # `fs.Mount("/m", r)`: no router's mount
+            where = under(mounter, _go_literal(prefix, source))
             for value in mounted_values(router, call):
                 span = (value.start_byte, value.end_byte)
                 settled[span] = where if settled.get(span, where) == where else None
