@@ -171,8 +171,9 @@ class MentionsExtractor:
 
 
 def _first_heading(content: str) -> str | None:
-    """Extract the first H1 heading from Markdown content."""
-    for line in content.splitlines():
+    """Extract the first H1 heading from Markdown content (after a UTF-8
+    byte-order mark, which decoding keeps and `strip` does not remove)."""
+    for line in content.removeprefix("\ufeff").splitlines():
         stripped = line.strip()
         if stripped.startswith("#") and not stripped.startswith("##"):
             return stripped.lstrip("#").strip()
