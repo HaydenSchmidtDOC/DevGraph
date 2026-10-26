@@ -1320,7 +1320,7 @@ class _CallResolver:
 
     def resolve(self, func: Node, scope: _Scope) -> list[tuple[str, str | None, bool]]:
         source = self.source
-        if func.type == "identifier":
+        if func.type in ("identifier", "shorthand_property_identifier"):  # the latter a route's `{ handler }`
             name = _text(func, source)
             if name in scope.params:
                 return []  # calling a parameter: it shadows any function of its name
@@ -1355,6 +1355,42 @@ _ROUTER_FACTORIES = frozenset({"express", "Router", "fastify", "Fastify"})
 #: Receivers taken for an app or router by name alone (and any `...Router`).
 _ROUTER_NAMES = frozenset({"app", "router", "fastify"})
 _HANDLER_TYPES = frozenset({"identifier", "member_expression", "call_expression", *_FUNCTION_VALUE_TYPES})
+
+
+#: A route handler given by its name: Fastify's `{ handler }` shorthand too.
+_NAMED_HANDLERS = ("identifier", "shorthand_property_identifier")
+
+
+def _route_options(node: Node, source: bytes) -> tuple[list[str], str, Node] | None:
+    """(methods, url, handler) of Fastify's route options object (`{ method:
+    'POST' or ['GET', 'HEAD'], url: '/x', handler: h }`, `path` for `url`,
+    `handler` also as `{ handler }` or a `handler(request, reply) {}`
+    method); None when a method or the url is not a literal, or one is
+    missing."""
+    methods: list[str] = []
+    url = handler = None
+    for prop in node.named_children:
+        if prop.type == "pair":
+            name_node, value = prop.child_by_field_name("key"), prop.child_by_field_name("value")
+            name = _literal(name_node, source) if name_node is not None and name_node.type == "string" else (
+                _text(name_node, source) if name_node is not None else None
+            )
+        elif prop.type == "shorthand_property_identifier":
+            name, value = _text(prop, source), prop
+        elif prop.type == "method_definition" and (name_node := prop.child_by_field_name("name")) is not None:
+            name, value = _text(name_node, source), prop
+        else:
+            continue
+        if name == "method" and value is not None:
+            found = [_literal(item, source) for item in (value.named_children if value.type == "array" else [value])]
+            if not found or None in found:
+                return None
+            methods = [each.upper() for each in found]
+        elif name in ("url", "path"):
+            url = _literal(value, source)
+        elif name == "handler":
+            handler = value
+    return (methods, url, handler) if methods and url is not None and handler is not None else None
 
 
 def _literal(node: Node | None, source: bytes) -> str | None:
@@ -1539,6 +1575,12 @@ def _express_routes(
             elif (specifier := _required(last, source)) is not None:
                 foreign.append((key(obj), mounted, "default", specifier))
             return
+        if method == "route" and len(values) == 1 and values[0].type == "object" and key(obj) is not None:
+            # Fastify's full form: `fastify.route({ method: 'POST', url: '/x', handler: h })`.
+            options = _route_options(values[0], source)
+            if options is not None and (options[1] == "" or options[1].startswith("/")):
+                routes.extend((key(obj), each, options[1], options[2]) for each in options[0])
+            return
         if method not in _ROUTE_METHODS:
             return
         path, handlers = None, values
@@ -1651,12 +1693,12 @@ def _express_routes(
         above = prefix(receiver)
         full = join_route(above or "", path)
         mounted = above is not None
-        if handler.type == "identifier" and _text(handler, source) in functions:
+        if handler.type in _NAMED_HANDLERS and _text(handler, source) in functions:
             # A function of the file: the top-level one, else any of the name.
             name = _text(handler, source)
             owner = "" if "" in functions[name] else None
             add_route(result, repo_id, file_path, "Express", method, full, name, owner, mounted=mounted)
-        elif handler.type in ("identifier", "member_expression"):
+        elif handler.type in (*_NAMED_HANDLERS, "member_expression"):
             # An imported function, or a member of an imported or typed
             # value: where a call to it would go.
             targets = resolver.resolve(handler, _Scope())
@@ -1668,6 +1710,105 @@ def _express_routes(
             add_route(result, repo_id, file_path, "Express", method, full, name, pins=pins, mounted=mounted)
         else:
             add_route(result, repo_id, file_path, "Express", method, full, mounted=mounted)
+
+
+#: NestJS's route method decorators and the method each maps (`All`: every one).
+_NEST_METHODS = {
+    "Get": "GET", "Post": "POST", "Put": "PUT", "Delete": "DELETE", "Patch": "PATCH", "Options": "OPTIONS",
+    "Head": "HEAD", "All": "*",
+}
+
+
+def _nest_routes(root: Node, source: bytes, result: ExtractionResult, file_path: str, repo_id: str) -> None:
+    """NestJS controllers' routes as Endpoints (apis/routes.py), in a file
+    importing its decorators from `@nestjs/common` (by the names it binds
+    them to): a class decorated `@Controller(prefix)` (a path, a list of
+    them, or `{ path }`; none for no prefix) maps each method decorated
+    `@Get(path)`, `@Post()`, ... `@All()` to `join_route(prefix, path)`,
+    the Endpoint implementing that method of the class. Only literal paths
+    are read; a global prefix (`app.setGlobalPrefix('api')`) or a
+    `RouterModule` path, set in another file, is not applied."""
+    nest = {
+        local: export for local, (export, specifier) in _imported_routers(root, source).items()
+        if specifier == "@nestjs/common"
+    }
+    if "Controller" not in nest.values():
+        return
+
+    def decorator(node: Node) -> tuple[str, list[Node]] | None:
+        """(the Nest export, its arguments) of a `@Name(...)` or `@Name` decorator."""
+        target = node.named_children[0] if node.named_children else None
+        if target is not None and target.type == "identifier" and _text(target, source) in nest:
+            return nest[_text(target, source)], []
+        func = target.child_by_field_name("function") if target is not None and target.type == "call_expression" else None
+        if func is None or func.type != "identifier" or _text(func, source) not in nest:
+            return None
+        args = target.child_by_field_name("arguments")
+        return nest[_text(func, source)], [a for a in (args.named_children if args else []) if a.type != "comment"]
+
+    def paths(args: list[Node]) -> list[str] | None:
+        """A decorator's literal path or paths, [""] for none; None when not literal."""
+        if not args:
+            return [""]
+        value = args[0]
+        if value.type == "object":  # `@Controller({ path: 'x' })`
+            pairs = [p for p in value.named_children if p.type == "pair"]
+            value = next((p.child_by_field_name("value") for p in pairs
+                          if _text(p.child_by_field_name("key"), source).strip("'\"") == "path"), None)
+            if value is None:
+                return [""]
+        found = [_literal(item, source) for item in (value.named_children if value.type == "array" else [value])]
+        return None if not found or None in found else found
+
+    owners: dict[str, set[str]] = {}  # the file's methods, by name, with their owners
+    for node in result.nodes:
+        if node.label == "Function" and node.properties.get("file") == file_path:
+            owners.setdefault(node.name, set()).add(node.properties.get("owner") or "")
+
+    def controller(cls: Node) -> None:
+        name = cls.child_by_field_name("name")
+        body = cls.child_by_field_name("body")
+        decorators = [c for c in cls.children if c.type == "decorator"]
+        if cls.parent is not None and cls.parent.type == "export_statement":
+            decorators += [c for c in cls.parent.children if c.type == "decorator"]
+        prefixes = None  # also for a prefix that is not a literal
+        for found in map(decorator, decorators):
+            if found is not None and found[0] == "Controller":
+                prefixes = paths(found[1])
+                break
+        if name is None or body is None or prefixes is None:
+            return
+        class_name = _text(name, source)
+        pending: list[Node] = []
+        for member in body.named_children:
+            if member.type == "decorator":
+                pending.append(member)
+                continue
+            method_name = member.child_by_field_name("name") if member.type == "method_definition" else None
+            if method_name is not None and method_name.type == "property_identifier":
+                handler = _text(method_name, source)
+                # The method's owner as the file's nodes have it (a class nested in another's members too).
+                owner = min(
+                    (each for each in owners.get(handler, ()) if each.rsplit(".", 1)[-1] == class_name),
+                    default=class_name,
+                )
+                for found in map(decorator, pending + [c for c in member.children if c.type == "decorator"]):
+                    if found is None or found[0] not in _NEST_METHODS or (routes := paths(found[1])) is None:
+                        continue
+                    for prefix in prefixes:
+                        for path in routes:
+                            add_route(
+                                result, repo_id, file_path, "NestJS", _NEST_METHODS[found[0]],
+                                join_route(prefix, path), handler, owner,
+                            )
+            pending = []
+
+    pending_nodes = [root]  # iterative: a deeply nested file is read on any thread's stack
+    while pending_nodes:
+        node = pending_nodes.pop()
+        if node.type in ("class_declaration", "abstract_class_declaration"):
+            controller(node)
+        pending_nodes += node.children
 
 
 def extract_js_file(
@@ -2063,6 +2204,7 @@ def extract_js_file(
                 no_self=no_self, caller_owner=caller_owner,
             ))
     _express_routes(root, source_bytes, resolver, result, file_path, repo_id, config)
+    _nest_routes(root, source_bytes, result, file_path, repo_id)
     merge_same_nodes(result)
     add_heir_keys(result, [
         (name, owner, info.bases, info.methods) for name, info in class_table.items() for owner in info.members_owners

@@ -232,7 +232,8 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: with an empty path (`router.get('', h)`, its router's mount); Flask
 #: `add_url_rule` (a `MethodView.as_view` view IMPLEMENTS its Class and its
 #: HTTP method handlers) and FastAPI `add_api_route` routes
-#: (apis/extractor.py `_rule_views`).
+#: (apis/extractor.py `_rule_views`); NestJS controllers' routes (jsts
+#: `_nest_routes`) and Fastify's `route({ method, url, handler })`.
 #: An index stamped lower, or not at all, is rescanned automatically.
 INDEX_FORMAT = 21
 
