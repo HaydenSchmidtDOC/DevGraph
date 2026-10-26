@@ -228,7 +228,8 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: Class and the request-handling methods of it (apis/extractor.py
 #: `_django_implements`), not a Function of the class's name; 21: an
 #: unprefixed Python router's `""` and `"/"` routes apart (`GET ? (file)`
-#: and `GET ?/ (file)` until a mount names them).
+#: and `GET ?/ (file)` until a mount names them), and an Express route
+#: with an empty path (`router.get('', h)`, its router's mount).
 #: An index stamped lower, or not at all, is rescanned automatically.
 INDEX_FORMAT = 21
 

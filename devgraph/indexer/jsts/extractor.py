@@ -1473,8 +1473,8 @@ def _express_routes(
     calls) as Endpoints (apis/routes.py). The receiver is an app or router
     the file makes (`_ROUTER_FACTORIES`, held by a name or by a class's
     `this.router`) or one named like one (`_ROUTER_NAMES`, `...Router`);
-    the path is a literal starting with "/", and the last argument is the
-    handler. An app's routes are at its root; a router's are under the
+    the path is a literal starting with "/" or empty (`router.get('', h)`,
+    the router's mount, as "/" is), and the last argument is the handler. An app's routes are at its root; a router's are under the
     literal prefix the file mounts it at (`app.use('/api', router)`), and
     a router the file doesn't mount on its app is mounted where the file
     doesn't show (`unmounted_endpoint`).
@@ -1553,10 +1553,12 @@ def _express_routes(
             path, obj = _literal(route_args.named_children[0], source), inner[0]
         elif values and (path := _literal(values[0], source)) is not None:
             handlers = values[1:]
-            if not path.startswith("/") and len(values) > 2:
+            if path and not path.startswith("/") and len(values) > 2:
                 # Koa-router's named route: `router.get('name', '/x', h)`.
                 path, handlers = _literal(values[1], source), values[2:]
-        if path is None or not path.startswith("/") or not handlers or handlers[-1].type not in _HANDLER_TYPES:
+        if path is None or not (path == "" or path.startswith("/")) or not handlers or (
+            handlers[-1].type not in _HANDLER_TYPES
+        ):
             return
         if key(obj) is not None:
             routes.append((key(obj), "*" if method == "all" else method.upper(), path, handlers[-1]))
