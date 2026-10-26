@@ -860,7 +860,8 @@ def _spring_routes(
     mapped functions too, implemented by its function and each implementing
     controller's (`spring_interface_pins`), whose functions carry a match
     key (`spring_implementer_key`) for each qualified name each of its
-    class's supertypes can have (`spring_type_names`)."""
+    class's supertypes can have (`spring_type_names`), unless the class has
+    a `@RequestMapping` of its own (Java's `_spring_routes`)."""
     keys: dict[tuple[str, str], set[str]] = {}
     package = resolver.layout.package
     imported = {name: ".".join([*owner[0], owner[1]]) for name, owner in resolver.types.items()}
@@ -877,7 +878,7 @@ def _spring_routes(
             supertypes = [
                 each for written in _written_supertypes(node, source)
                 for each in spring_type_names(written, package, imported, resolver.wildcards)
-            ] if SPRING_CONTROLLERS & set(mapped) else []
+            ] if SPRING_CONTROLLERS & set(mapped) and "RequestMapping" not in mapped else []
             for member in body.named_children:
                 function = member.child_by_field_name("name")
                 if member.type == "function_declaration" and function is not None:

@@ -598,7 +598,10 @@ def _spring_routes(
     controller's (`spring_interface_pins`). Returns the match keys
     (`spring_implementer_key`) of each controller method (name, owner) for
     the interfaces its class implements, by their qualified names
-    (`spring_type_names`, through the file's package and imports)."""
+    (`spring_type_names`, through the file's package and imports). A
+    controller with a `@RequestMapping` of its own gets none: Spring maps
+    its interface methods under its own prefix, which no interface's route
+    names (see the README's current limitations)."""
     keys: dict[tuple[str, str], set[str]] = {}
     package = resolver.layout.package
     imported = {name: ".".join([*owner[0], resolver.type_owners[name]]) for name, owner in resolver.types.items()}
@@ -624,7 +627,7 @@ def _spring_routes(
                     for http_method, path in spring_routes(mapped, _annotations(member, source), interface):
                         add_route(result, repo_id, file_path, "Spring", http_method, path, _text(method, source),
                                   _owner_of(inner), pins)
-                    if SPRING_CONTROLLERS & set(mapped) and implemented:
+                    if SPRING_CONTROLLERS & set(mapped) and "RequestMapping" not in mapped and implemented:
                         keys.setdefault((_text(method, source), _owner_of(inner)), set()).update(
                             spring_implementer_key(name) for each in implemented
                             for name in spring_type_names(_written_type(each, source), package, imported,
