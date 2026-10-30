@@ -353,6 +353,12 @@ class _FakeEngine:
     def delete_bare_class_stubs(self, repo_id):
         return 0
 
+    def delete_docs_notes_outside(self, repo_id, folder):
+        return 0
+
+    def delete_documents(self, repo_id):
+        return 0
+
 
 def test_prune_stale_files_tolerates_a_junction_out_of_the_repository(junction_tree, monkeypatch):
     repo = junction_tree

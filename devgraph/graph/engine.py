@@ -15,7 +15,7 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING, Any
 
 from neo4j import Driver, GraphDatabase, NotificationDisabledClassification, Query, READ_ACCESS, unit_of_work
@@ -2000,6 +2000,41 @@ class GraphEngine:
             records = [record.data() for record in result or []]
         return records[0]["format"] if records else None
 
+    def set_scan_options(self, repo_id: str, docs_path: str, mentions_enabled: bool) -> None:
+        """Record the docs path and mentions setting the repository's last full scan used."""
+        with self._driver.session() as session:
+            _run(
+                session,
+                "MATCH (r:Repository {repo_id: $repo_id}) "
+                "SET r.scan_docs_path = $docs_path, r.scan_mentions = $mentions",
+                repo_id=repo_id, docs_path=docs_path, mentions=mentions_enabled,
+            )
+
+    def scan_options(self, repo_id: str) -> tuple[str, bool] | None:
+        """(docs path, mentions setting) the last full scan used, or None when
+        none is recorded (an index before format 22, or no Repository node)."""
+        with self._driver.session() as session:
+            result = _run_records(
+                session,
+                "MATCH (r:Repository {repo_id: $repo_id}) WHERE r.scan_mentions IS NOT NULL "
+                "RETURN r.scan_docs_path AS docs_path, r.scan_mentions AS mentions",
+                repo_id=repo_id,
+            )
+            records = [record.data() for record in result or []]
+        return (records[0]["docs_path"], records[0]["mentions"]) if records else None
+
+    def delete_documents(self, repo_id: str) -> int:
+        """Delete this repo's mentions Documents, with their MENTIONS edges, and
+        return how many went."""
+        with self._driver.session() as session:
+            result = _run_records(
+                session,
+                "MATCH (d:Document {repo_id: $repo_id}) DETACH DELETE d RETURN count(d) AS n",
+                repo_id=repo_id,
+            )
+            record = result[0] if result else None
+            return record["n"] if record else 0
+
     def read_all_applied_schemas(self) -> list[dict[str, Any]]:
         """Every repository's recorded user labels and keys, from the graph itself."""
         with self._driver.session() as session:
@@ -2273,22 +2308,22 @@ class GraphEngine:
             record = result[0] if result else None
             return record["n"] if record else 0
 
-    def delete_docs_notes_outside(self, repo_id: str, folder: str) -> int:
+    def delete_docs_notes_outside(self, repo_id: str, folder: str | None) -> int:
         """Delete this repo's docs notes (Requirement, DesignDecision,
         ArchitectureNote) whose `source_file` is not under `folder` (a
-        repo-relative POSIX path, not the root), with their edges, and return
-        how many went. Notes under the docs path record their repo-relative
-        path, so only a note an older scan keyed by its bare filename, or one
-        left from a former docs path, looks like this."""
+        repo-relative POSIX path, not the root; None: every note), with their
+        edges, and return how many went. Notes under the docs path record
+        their repo-relative path, so only a note an older scan keyed by its
+        bare filename, or one left from a former docs path, looks like this."""
         with self._driver.session() as session:
             result = _run_records(
                 session,
                 "MATCH (n {repo_id: $repo_id}) "
                 "WHERE (n:Requirement OR n:DesignDecision OR n:ArchitectureNote) "
-                "  AND n.source_file IS NOT NULL AND NOT n.source_file STARTS WITH $prefix "
+                "  AND n.source_file IS NOT NULL AND ($prefix IS NULL OR NOT n.source_file STARTS WITH $prefix) "
                 "DETACH DELETE n RETURN count(n) AS n",
                 repo_id=repo_id,
-                prefix=folder.rstrip("/") + "/",
+                prefix=None if folder is None else folder.rstrip("/") + "/",
             )
             record = result[0] if result else None
             return record["n"] if record else 0
@@ -2777,6 +2812,39 @@ class GraphEngine:
             )
             return {record["repo_id"] for record in result or []}
 
+    def repository_owner(self, repo_id: str) -> tuple[bool, str | None]:
+        """Whether `repo_id` holds data, and its Repository node's path (None
+        when it has none). Index lookups only: the Repository node through
+        its uniqueness constraint, then each built-in label's named nodes
+        through its `(repo_id, name)` index, so the cost doesn't grow with
+        the database."""
+        with self._driver.session() as session:
+            rows = _run_records(
+                session, "MATCH (r:Repository {repo_id: $repo_id}) RETURN r.path AS path LIMIT 1", repo_id=repo_id
+            )
+            if rows:
+                return True, rows[0]["path"]
+            rows = _run_records(
+                session,
+                _union(
+                    f"MATCH (n:{label}) WHERE n.repo_id = $repo_id AND n.name IS NOT NULL RETURN 1 AS one"
+                    for label in NAMED_LABELS
+                )
+                + "RETURN one LIMIT 1",
+                repo_id=repo_id,
+            )
+            return bool(rows), None
+
+    def repo_node_counts(self, repo_ids: Iterable[str]) -> dict[str, int]:
+        """How many nodes carry each of these repo_ids; an id no node carries is left out."""
+        with self._driver.session() as session:
+            result = _run_records(
+                session,
+                "MATCH (n) WHERE n.repo_id IN $repo_ids RETURN n.repo_id AS repo_id, count(*) AS count",
+                repo_ids=list(repo_ids),
+            )
+            return {record["repo_id"]: record["count"] for record in result or []}
+
     def delete_repository(self, repo_id: str) -> None:
         """Remove every node (and its relationships) scoped to this repo_id."""
         with self._driver.session() as session:
@@ -2994,6 +3062,52 @@ def _graph_shaped(result: Any, max_rows: int | None = None) -> dict[str, Any]:
             }
         )
     return {"columns": columns, "data": data, "truncated": truncated}
+
+
+def taken_by_another_repository(engine: GraphEngine, repo_path: Path | str, held: list[str]) -> Callable[[str], bool]:
+    """`RepoRegistry.add_repo`'s `is_taken` for registering `repo_path`: an id
+    `foreign_graph_data` refuses, each added to `held`. An id that can't be
+    checked (Neo4j slow or down) counts as free: the check before the first
+    scan refuses it then, rather than registration failing."""
+
+    def is_taken(repo_id: str) -> bool:
+        try:
+            taken = foreign_graph_data(engine, repo_id, repo_path) is not None
+        except Exception as exc:  # neo4j driver raises its own exception hierarchy
+            logger.info("could not check the graph for %s before registering it: %s", repo_id, exc)
+            return False
+        if taken:
+            held.append(repo_id)
+        return taken
+
+    return is_taken
+
+
+def foreign_graph_data(engine: GraphEngine, repo_id: str, repo_path: Path | str) -> str | None:
+    """Why `repo_id` must not be registered for, or first scanned from,
+    `repo_path`, else None.
+
+    The graph holding data under `repo_id` whose Repository node names
+    another path, or with no Repository node (whose owner can't be told),
+    is another repository's: another DevGraph install's live one on a shared
+    Neo4j, or one unregistered with `remove --keep-graph`. Registration skips
+    such an id (`RepoRegistry.add_repo`'s `is_taken`), and every first write
+    to a never-indexed repository (registration's own scan, `rescan`, the
+    agent, `index-history`, `annotate --note`) refuses instead of merging
+    into it, since registration may not have been able to look. Data whose
+    Repository node names this same path is this repository's (registered
+    again, or the identical path on another machine sharing the Neo4j, which
+    then shares this graph) and is adopted. Nothing is ever deleted.
+    """
+    held, owner = engine.repository_owner(repo_id)
+    if not held or owner == str(repo_path):
+        return None
+    where = f"a repository at {owner}" if owner else "a repository whose Repository node is gone"
+    return (
+        f"the graph already holds data under {repo_id} from {where}, not {repo_path}; nothing was indexed. "
+        f"Run 'devgraph remove {repo_id} --keep-graph' and register the repository again: it gets a free id, "
+        "and the old data is left in place."
+    )
 
 
 def provision_repository_schema(engine: GraphEngine, repo_root: Path | str) -> None:

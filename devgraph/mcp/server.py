@@ -662,7 +662,8 @@ def build_server(
     ) -> dict[str, Any]:
         """Return the most-connected nodes in the graph — the core abstractions
         a new agent should look at first to orient itself in an unfamiliar repo.
-        Returns {count, results, truncated} with degree (number of direct relationships)."""
+        Returns {count, results, truncated} with degree (number of direct relationships).
+        Git history (commits, PRs, issues) and mentions documents are left out."""
         return devgraph_tools.god_nodes(
             engine, repo_id, cross_repo, max_results,
             declared_labels=(
@@ -933,17 +934,19 @@ def build_server(
         repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15
     ) -> dict[str, Any]:
         """Find requirements a component (module/service/etc.) satisfies; returns
-        {count, results, truncated}. An unknown component is an error with similar names."""
+        {count, results, truncated}. An unknown component is an error with similar names.
+        A `notice` says when a changed docs path is not indexed yet."""
         return devgraph_tools.find_requirements_for(
-            engine, repo_id, component_name, cross_repo, max_results, declared(repo_id, cross_repo)
+            engine, repo_id, component_name, cross_repo, max_results, declared(repo_id, cross_repo), registry
         )
 
     @server.tool(annotations=_READ_ONLY)
     def trace_design_rationale(repo_id: str, component_name: str, cross_repo: bool = False) -> dict[str, Any]:
         """Trace the design rationale (requirements, decisions, notes) behind a component.
-        An unknown component is an error with similar names."""
+        An unknown component is an error with similar names. A `notice` says when a changed
+        docs path is not indexed yet."""
         return devgraph_tools.trace_design_rationale(
-            engine, repo_id, component_name, cross_repo, declared(repo_id, cross_repo)
+            engine, repo_id, component_name, cross_repo, declared(repo_id, cross_repo), registry
         )
 
     @server.tool(annotations=_READ_ONLY)
@@ -959,7 +962,7 @@ def build_server(
         direction="mentioned_by" (default): find Documents mentioning the entity named name.
         direction="mentions": find what the Document at repo-relative path name mentions.
         With the repository's mentions indexing off, the envelope is empty and a `notice`
-        says how to enable it."""
+        says how to enable it; a `notice` also says when a change to it awaits its rescan."""
         return devgraph_tools.find_mentions(
             engine, repo_id, name, label, direction, cross_repo, max_results, registry
         )

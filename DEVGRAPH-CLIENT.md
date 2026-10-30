@@ -145,7 +145,7 @@ with `type: requirement|design_decision|architecture_note` front-matter;
 
 ```bash
 "<venv python>" -P -m devgraph.cli.main annotate <repo_id> --docs-path <repo-relative docs folder>
-"<venv python>" -P -m devgraph.cli.main annotate <repo_id> --note <repo-relative note file>   # index one note immediately
+"<venv python>" -P -m devgraph.cli.main annotate <repo_id> --note <repo-relative note file>   # index one note under the docs path immediately
 ```
 
 **PR/issue history** is opt-in and talks to an external service (GitHub,
@@ -252,8 +252,8 @@ it is on, results cover registered repositories only.
 `find_related_files` match against function/class **names** only (a file
 path like `shared/utils/x.py` returns empty; the function name defined in
 that file, e.g. `batch_retrieve_payloads`, returns real results).
-`blame_component` is the opposite — it wants a **file path**, not a function
-name. `get_source` also takes a function/class **name**. `describe_node`
+`blame_component` is the opposite — it wants a **file path** (repo-relative;
+`./src/a.py` and `src\a.py` work too), not a function name. `get_source` also takes a function/class **name**. `describe_node`
 takes a node's exact **name**; a file, folder or docs node can also be named
 by its repo-relative path, and a docs node keyed by a front-matter id by that
 id (for example `ADR-013`). Passing the wrong
@@ -408,7 +408,7 @@ Prefer these over re-reading files when the question is structural:
 | "What changed between my branch and main?" | `compare_branches(branch_a="main", branch_b="<branch>")`: files, per-file symbols added, removed and changed, and the graph callers of what changed |
 | "Why was X built this way?" | `explain_decision`, `trace_design_rationale` |
 | "What requirements does X satisfy?" | `find_requirements_for` |
-| "Which docs mention X?" | `find_mentions` (only useful if Markdown mentions indexing was enabled; otherwise an empty result whose `notice` names the enable command) |
+| "Which docs mention X?" | `find_mentions` (only useful if Markdown mentions indexing was enabled; otherwise an empty result whose `notice` names the enable command; just after the setting or the docs path changed, a `notice` says the rescan applying it is still to come) |
 | "Who changed X and when?" | `blame_component` (file path, not name) |
 | "What PRs/issues touched X?" | `find_related_prs`, `issue_history_for` (only useful if PR/issue ingestion was enabled in step 2; otherwise they return an empty result whose `notice` names the enable command, and never contact GitHub) |
 | "Show me X's actual code" | `get_source` (name, not path — returns source text + full docstring; reads live from disk using the last-indexed line range, so rescan first if the file may have changed; a name defined in several files returns `status: "ambiguous"` with `candidates`, so pass `file` to pick one; each candidate carries `owner`, which `get_source` also takes, to pick one of several same-named functions in one file; a method can be named `A.save` or `A::save`, and a Kotlin companion's member `Repo.create`) |

@@ -243,14 +243,32 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: `add_url_rule` (a `MethodView.as_view` view IMPLEMENTS its Class and its
 #: HTTP method handlers) and FastAPI `add_api_route` routes
 #: (apis/extractor.py `_rule_views`); NestJS controllers' routes (jsts
-#: `_nest_routes`) and Fastify's `route({ method, url, handler })`.
+#: `_nest_routes`) and Fastify's `route({ method, url, handler })`; 22:
+#: git commit dates and recency in UTC (git_history `HISTORY_FORMAT` 2, its
+#: own stamp: a full scan writes no history, so the repository's next
+#: history sync migrates its stored dates in place); the docs path and
+#: mentions setting a full scan used recorded on the Repository node
+#: (`scan_options_pending`), its mentions Documents deleted with mentions
+#: off and its docs notes with no docs path; docs notes and front matter
+#: read after a UTF-8 byte-order mark; and a docs note's `links` naming a
+#: Service as well as a Module.
 #: An index stamped lower, or not at all, is rescanned automatically.
-INDEX_FORMAT = 21
+INDEX_FORMAT = 22
 
 
 def index_outdated(engine: GraphEngine, repo_id: str) -> bool:
     """True when the repository's last full scan predates `INDEX_FORMAT`."""
     return (engine.index_format(repo_id) or 1) < INDEX_FORMAT
+
+
+def scan_options_pending(engine: GraphEngine, repo_id: str, docs_path: str | None, mentions_enabled: bool) -> bool:
+    """True when the repository's docs path or mentions setting differs from
+    the ones its last full scan used (`devgraph annotate --docs-path`,
+    `devgraph mentions`): only a full scan indexes, or removes, every note,
+    Document and MENTIONS edge they decide. An index with none recorded
+    (before INDEX_FORMAT 22) is outdated, and its upgrade records them."""
+    used = engine.scan_options(repo_id)
+    return used is not None and used != (docs_path or "", bool(mentions_enabled))
 
 
 def schema_pending(engine: GraphEngine, repo_id: str, repo_root: Path) -> bool:
@@ -2085,14 +2103,14 @@ def _find_referrers(
 
 
 # Labels a docs note's SUPERSEDES/DECIDED_BY/`links` edges can point at.
-_DOCS_NOTE_TARGET_LABELS = {"DesignDecision", "ArchitectureNote", "Module"}
+_DOCS_NOTE_TARGET_LABELS = {"DesignDecision", "ArchitectureNote", "Module", "Service"}
 
 
 def _docs_note_referrers(
     repo_id: str, root: Path, docs_root: Path | None, added: set[tuple[str, str]], batch: set[str]
 ) -> set[str]:
     """Docs notes whose SUPERSEDES/DECIDED_BY/`links` edge names an added
-    note or Module. Re-parses each note outside the batch (docs folders are
+    note, Module or Service. Re-parses each note outside the batch (docs folders are
     small; no graph access) and keeps only those with an edge endpoint in
     `added`."""
     if docs_root is None or not any(label in _DOCS_NOTE_TARGET_LABELS for label, _name in added):
@@ -2400,6 +2418,11 @@ def _docs_folder(repo_root: Path, docs_path: str | None) -> str | None:
     return folder.relative_to(root).as_posix()
 
 
+def _is_repo_root(repo_root: Path, docs_path: str) -> bool:
+    """Whether the docs path is the repository root itself."""
+    return (repo_root / docs_path).resolve() == repo_root.resolve()
+
+
 def prune_stale_files(
     engine: GraphEngine,
     repo_id: str,
@@ -2423,6 +2446,11 @@ def prune_stale_files(
     touched. Every path the graph has that is no longer an indexable file on
     disk is routed through remove_paths, which handles the delete-vs-unclaim
     distinction per node.
+
+    Docs notes outside the docs path, every note when there is none, and
+    every mentions Document with `mentions_enabled` off are deleted too:
+    nodes of files still on disk that the scan's settings no longer index
+    (`devgraph annotate --docs-path`, `devgraph mentions disable`).
 
     Module nodes with no file key at all, left by an older git-history sync,
     are deleted first, and so are Class nodes with no `file` or `source` (a
@@ -2460,10 +2488,23 @@ def prune_stale_files(
     docs_folder = _docs_folder(repo_root, docs_path)
     # Skipped when the docs path is the repository root: every path is under
     # it, so nothing tells a bare filename key from a root-level note's path.
-    if docs_folder is not None:
+    # With no docs path (or one outside the repository) no note is indexed.
+    if not (docs_path and _is_repo_root(repo_root, docs_path)):
         misplaced = engine.delete_docs_notes_outside(repo_id, docs_folder)
         if misplaced:
-            logger.info("removed %d docs notes keyed outside %s from %s", misplaced, docs_folder, repo_id)
+            # A warning: a note `annotate --note` indexed outside the docs
+            # path (or with none set) is gone without the user deleting it.
+            logger.warning(
+                "removed %d docs notes outside the docs path (%s) from %s: notes are indexed only under the "
+                "docs path; set it with `devgraph annotate %s --docs-path <folder>`",
+                misplaced, docs_folder or docs_path or "none set",
+                repo_id, repo_id,
+            )
+    # Mentions indexing turned off since: a fresh scan makes no Document.
+    if not mentions_enabled:
+        documents = engine.delete_documents(repo_id)
+        if documents:
+            logger.info("removed %d mentions Documents from %s (mentions indexing is off)", documents, repo_id)
     stale = _graph_files(engine, repo_id, repo_root) - on_disk
     if unreadable:
         # A folder that couldn't be listed says nothing about its files: keep them.
@@ -3037,6 +3078,7 @@ def full_scan(
             _sync_docs_edges(engine, repo_id, repo_root, applied_docs)
         engine.write_resolver_config(repo_id, resolver)
         _check_full_scan_claim(repo_id)  # taken over meanwhile: that scan stamps it
+        engine.set_scan_options(repo_id, docs_path or "", mentions_enabled)
         engine.set_index_format(repo_id, INDEX_FORMAT)
         return indexed
     finally:

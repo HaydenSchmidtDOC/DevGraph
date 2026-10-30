@@ -42,6 +42,7 @@ class Rig:
         self.registry.get.return_value = RepoRecord(REPO, root, True, True, None, docs_path=None)
         self.engine = MagicMock()
         self.engine.index_format.return_value = dispatch.INDEX_FORMAT
+        self.engine.repository_owner.return_value = (False, None)  # no other repository's data under REPO
         self.events: list[dict] = []
         self.requests: list[tuple] = []
         self.sync = RepoSync(

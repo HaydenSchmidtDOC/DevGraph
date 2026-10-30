@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from devgraph.graph.engine import foreign_graph_data
 from devgraph.indexer.dispatch import (
     catch_up,
     index_paths,
@@ -74,6 +75,25 @@ class RepoSync:
         self._warned: dict[str, datetime] = {}
         self._running = 0
         self.stopping = False
+        # Never-indexed repositories refused for another repository's graph data, warned about once.
+        self._foreign_warned: set[str] = set()
+
+    def _foreign(self, repo: Any) -> bool:
+        """Whether `repo`, never indexed, has an id the graph holds another
+        repository's data under (it was registered while Neo4j was down, so the
+        id was never checked): nothing is written for it, never merged into
+        that data, and a warning says why, once."""
+        if repo.last_indexed:
+            return False
+        problem = foreign_graph_data(self._engine, repo.repo_id, repo.path)
+        if problem is None:
+            return False
+        with self._lock:
+            first = repo.repo_id not in self._foreign_warned
+            self._foreign_warned.add(repo.repo_id)
+        if first:
+            logger.warning("Not indexing %s: %s", repo.repo_id, problem)
+        return True
 
     def _while_waiting(self, repo_id: str) -> Callable[[], bool] | None:
         if self._yield_lock is None:
@@ -108,6 +128,8 @@ class RepoSync:
             repo = self._registry.get(repo_id)
             if repo is None:
                 return  # removed between the event firing and now
+            if self._foreign(repo):
+                return
             indexed = removed = 0
             if changed_paths:
                 indexed = index_paths(
@@ -167,6 +189,12 @@ class RepoSync:
             since = floor
         repo = self._registry.get(repo_id)
         if repo is None:
+            return False
+        try:
+            foreign = self._foreign(repo)
+        except Exception:
+            foreign = False  # Neo4j unreachable: the catch-up below fails and is retried as any other
+        if foreign:
             return False
         logger.log(
             logging.INFO if reason == "start" else logging.DEBUG,
