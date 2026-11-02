@@ -22,6 +22,7 @@
   /* Side of the fixed normalisation box. Any positive number works; the
      value only sets the scale of Sigma's internal 0..1 space. */
   const L = 1000;
+  const CURVE_SEGMENTS = 10, CURVE_BEND = 0.15; /* bezier pieces per curved edge; control point offset as a fraction of the edge length */
   const NODE_SIZE_SCALE = 0.5; /* Cytoscape node `width` is a diameter in px; Sigma `size` is a radius */
 
   /* ── node shapes ───────────────────────────────────────────────────────
@@ -92,6 +93,112 @@
         gl.uniformMatrix3fv(u.u_matrix, false, params.matrix);
       }
     };
+  }
+
+  /* ── gradient edges, straight or curved ────────────────────────────────
+     One GPU program draws an edge as a quadratic bezier cut into `segments`
+     quads, colour mixed from the source end to the target end. segments = 1
+     with curvature 0 is a plain straight gradient edge (a single quad, no
+     more expensive than Sigma's own line); curved edges cost segments x 2
+     triangles per edge, so the page only uses them on small graphs. The line
+     stops short of the target by the node radius plus the arrow head, and a
+     stock arrow head is drawn on the end of the curve's tangent. */
+  function makeGradientEdgeProgram(segments, curvature) {
+    const R = global.Sigma.rendering;
+    const { floatColor } = global.Sigma.utils;
+    const GL = global.WebGLRenderingContext;
+    const VERT = `
+      attribute vec4 a_id; attribute vec4 a_colorStart; attribute vec4 a_colorEnd;
+      attribute vec2 a_positionStart; attribute vec2 a_positionEnd;
+      attribute float a_thickness; attribute float a_radius;
+      attribute float a_t; attribute float a_side; attribute float a_isEnd;
+      uniform mat3 u_matrix; uniform float u_zoomRatio; uniform float u_sizeRatio; uniform float u_pixelRatio;
+      uniform float u_correctionRatio; uniform float u_feather; uniform float u_minEdgeThickness; uniform float u_lengthToThicknessRatio;
+      varying vec4 v_color; varying float v_side; varying float v_thickness; varying float v_feather;
+      const float bias = 255.0 / 254.0;
+      void main() {
+        vec2 d = a_positionEnd - a_positionStart;
+        vec2 ctrl = (a_positionStart + a_positionEnd) * 0.5 + vec2(-d.y, d.x) * ${curvature.toFixed(4)};
+        float mt = 1.0 - a_t;
+        vec2 p = mt * mt * a_positionStart + 2.0 * mt * a_t * ctrl + a_t * a_t * a_positionEnd;
+        vec2 tangent = 2.0 * mt * (ctrl - a_positionStart) + 2.0 * a_t * (a_positionEnd - ctrl);
+        float tl = length(tangent);
+        tangent = tl > 1e-12 ? tangent / tl : vec2(1.0, 0.0);
+        vec2 n = vec2(-tangent.y, tangent.x);
+        float pixelsThickness = max(a_thickness, u_minEdgeThickness * u_sizeRatio);
+        float wt = pixelsThickness * u_correctionRatio / u_sizeRatio;
+        float stop = a_radius * 2.0 * u_correctionRatio / u_sizeRatio + wt * u_lengthToThicknessRatio * 2.0;
+        p -= tangent * a_isEnd * stop;
+        gl_Position = vec4((u_matrix * vec3(p + n * a_side * wt, 1)).xy, 0, 1);
+        v_thickness = wt / u_zoomRatio;
+        v_side = a_side;
+        v_feather = u_feather * u_correctionRatio / u_zoomRatio / u_pixelRatio * 2.0;
+        #ifdef PICKING_MODE
+        v_color = a_id;
+        #else
+        v_color = mix(a_colorStart, a_colorEnd, a_t);
+        #endif
+        v_color.a *= bias;
+      }`;
+    const FRAG = `
+      precision mediump float;
+      varying vec4 v_color; varying float v_side; varying float v_thickness; varying float v_feather;
+      const vec4 transparent = vec4(0.0, 0.0, 0.0, 0.0);
+      void main(void) {
+        #ifdef PICKING_MODE
+        gl_FragColor = v_color;
+        #else
+        float dist = abs(v_side) * v_thickness;
+        gl_FragColor = mix(v_color, transparent, smoothstep(v_thickness - v_feather, v_thickness, dist));
+        #endif
+      }`;
+    const rows = [];
+    for (let i = 0; i < segments; i++) {
+      const t0 = i / segments, t1 = (i + 1) / segments, e1 = i === segments - 1 ? 1 : 0;
+      rows.push([t0, 1, 0], [t0, -1, 0], [t1, 1, e1], [t1, 1, e1], [t0, -1, 0], [t1, -1, e1]);
+    }
+    class Line extends R.EdgeProgram {
+      getDefinition() {
+        return {
+          VERTICES: rows.length, VERTEX_SHADER_SOURCE: VERT, FRAGMENT_SHADER_SOURCE: FRAG, METHOD: GL.TRIANGLES,
+          UNIFORMS: ["u_matrix", "u_zoomRatio", "u_sizeRatio", "u_pixelRatio", "u_correctionRatio", "u_feather", "u_minEdgeThickness", "u_lengthToThicknessRatio"],
+          ATTRIBUTES: [
+            { name: "a_positionStart", size: 2, type: GL.FLOAT }, { name: "a_positionEnd", size: 2, type: GL.FLOAT },
+            { name: "a_thickness", size: 1, type: GL.FLOAT },
+            { name: "a_colorStart", size: 4, type: GL.UNSIGNED_BYTE, normalized: true }, { name: "a_colorEnd", size: 4, type: GL.UNSIGNED_BYTE, normalized: true },
+            { name: "a_id", size: 4, type: GL.UNSIGNED_BYTE, normalized: true }, { name: "a_radius", size: 1, type: GL.FLOAT },
+          ],
+          CONSTANT_ATTRIBUTES: [{ name: "a_t", size: 1, type: GL.FLOAT }, { name: "a_side", size: 1, type: GL.FLOAT }, { name: "a_isEnd", size: 1, type: GL.FLOAT }],
+          CONSTANT_DATA: rows,
+        };
+      }
+      processVisibleItem(idColor, i, src, tgt, data) {
+        const a = this.array;
+        a[i++] = src.x; a[i++] = src.y; a[i++] = tgt.x; a[i++] = tgt.y; a[i++] = data.size || 1;
+        a[i++] = floatColor(data.color); a[i++] = floatColor(data.colorEnd || data.color); a[i++] = idColor; a[i++] = tgt.size || 1;
+      }
+      setUniforms(params, { gl, uniformLocations: u }) {
+        gl.uniformMatrix3fv(u.u_matrix, false, params.matrix);
+        gl.uniform1f(u.u_zoomRatio, params.zoomRatio);
+        gl.uniform1f(u.u_sizeRatio, params.sizeRatio);
+        gl.uniform1f(u.u_pixelRatio, params.pixelRatio);
+        gl.uniform1f(u.u_correctionRatio, params.correctionRatio);
+        gl.uniform1f(u.u_feather, params.antiAliasingFeather);
+        gl.uniform1f(u.u_minEdgeThickness, params.minEdgeThickness);
+        gl.uniform1f(u.u_lengthToThicknessRatio, R.DEFAULT_EDGE_ARROW_HEAD_PROGRAM_OPTIONS.lengthToThicknessRatio);
+      }
+    }
+    /* The stock head points from its "source" to the target, so hand it the curve's control point as the source. */
+    const fakeSource = { x: 0, y: 0 }, fakeData = { color: "", size: 1 };
+    class Head extends R.EdgeArrowHeadProgram {
+      processVisibleItem(idColor, i, src, tgt, data) {
+        fakeSource.x = (src.x + tgt.x) / 2 - (tgt.y - src.y) * curvature;
+        fakeSource.y = (src.y + tgt.y) / 2 + (tgt.x - src.x) * curvature;
+        fakeData.color = data.colorEnd || data.color; fakeData.size = data.size;
+        return super.processVisibleItem(idColor, i, fakeSource, tgt, fakeData);
+      }
+    }
+    return R.createEdgeCompoundProgram([Line, Head]);
   }
 
   /* ── elements and collections ──────────────────────────────────────── */
@@ -195,6 +302,8 @@
     let rafId = 0, dirtyAll = false, movedAll = false;
     const dirtyEles = new Set();
     let batchDepth = 0;
+    const curvedLimit = opts.curvedEdgeLimit ?? 3000; /* curved edges cost ~10x the triangles; past this many nodes they go straight */
+    let curved = true;
 
     const cy = {
       _byId: byId,
@@ -207,8 +316,13 @@
       hexagon: makeShapeProgram("max(q.x * 0.8660254 + q.y * 0.5, q.y) - r * 0.8660254"),
       diamond: makeShapeProgram("(q.x + q.y) * 0.7071068 - r * 0.7071068 * 1.2"),
     };
+    const edgeProgramClasses = {
+      straight: makeGradientEdgeProgram(1, 0),
+      curved: makeGradientEdgeProgram(CURVE_SEGMENTS, CURVE_BEND),
+    };
     const sigma = new Sigma(graph, container, {
-      defaultEdgeType: "arrow",
+      defaultEdgeType: "straight",
+      edgeProgramClasses,
       defaultNodeType: "circle",
       nodeProgramClasses,
       renderLabels: true,
@@ -218,7 +332,7 @@
       labelColor: { color: "#8a8f98" },
       defaultDrawNodeHover: () => {}, /* the page draws its own hover treatment; Sigma's default is a white label box */
       enableEdgeEvents: true,
-      itemSizesReference: "positions",
+      itemSizesReference: "screen",
       zoomToSizeRatioFunction: () => 1,
       stagePadding: 0,
       autoRescale: false,
@@ -296,6 +410,8 @@
         if (s.labelColor) a.labelColor = s.labelColor; else delete a.labelColor;
       } else {
         a.zIndex = s.z || 0;
+        a.colorEnd = s.colorEnd || s.color;
+        a.type = curved ? "curved" : "straight";
       }
     }
     function listsRebuild() {
@@ -307,6 +423,7 @@
     function flush() {
       rafId = 0;
       listsRebuild();
+      if (curved !== nodes.length <= curvedLimit) { curved = !curved; dirtyAll = true; }
       let partial = null;
       if (dirtyAll) { nodes.forEach(applyStyle); edges.forEach(applyStyle); }
       else {
@@ -340,7 +457,7 @@
         const d = el.data;
         if (d.source === undefined) continue;
         if (!byId.has(d.source) || !byId.has(d.target)) continue; /* Cytoscape would throw; the page only adds edges between nodes it has */
-        graph.addEdgeWithKey(d.id, d.source, d.target, { size: 1, color: "#888", type: "arrow" });
+        graph.addEdgeWithKey(d.id, d.source, d.target, { size: 1, color: "#888", type: curved ? "curved" : "straight" });
         const e = new Ele(cy, false, d, graph.getEdgeAttributes(d.id));
         byId.set(d.id, e); added.push(e); listsStale = true; dirtyEles.add(e);
       }

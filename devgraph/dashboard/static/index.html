@@ -1334,9 +1334,10 @@ function edgeStyle(e) {
   const hover = e.hasClass("hover-hl"), excluded = e.hasClass("excluded");
   const glow = e.data("glow") || 0;
   const alpha = e.hasClass("faded") ? 0.07 : hover ? 1 : excluded ? 0.25 : 0.35 + glow * 0.55;
-  /* the source-to-target gradient is not available on WebGL edges: edges take the target's colour, as heavy-mode always did */
-  const color = excluded ? "#62666d" : catColor(e.target().data("cat"));
-  return { hidden: e.hasClass("culled"), color: withAlpha(color, alpha), size: hover ? 2.2 : 1, z: hover ? 15 : 0 };
+  /* source colour fading to target colour; excluded edges stay flat grey */
+  const to = excluded ? "#62666d" : catColor(e.target().data("cat"));
+  const from = excluded ? to : catColor(e.source().data("cat"));
+  return { hidden: e.hasClass("culled"), color: withAlpha(from, alpha), colorEnd: withAlpha(to, alpha), size: hover ? 2.2 : 1, z: hover ? 15 : 0 };
 }
 const cy = GraphView.create({
   container: document.getElementById("cy"),
