@@ -80,3 +80,23 @@ d3-force is a layout library, not a renderer, so it only matters for `forceDirec
 - **d3-force is not an improvement.** It costs more per step and needs more steps, for a layout no tighter than the app's. Its Barnes-Hut is the same technique the app already uses. Switching would change the layout's character for no gain.
 - **The real problem is where the settle runs.** The app runs 3 steps per animation frame on the main thread, so a frame is blocked for ~270 ms at 9.7k nodes and ~480 ms at 14.2k, before Cytoscape repaints anything. Typed arrays cut that by 25-35%, but the cost stays far above a frame budget at any size past a few thousand nodes.
 - **Recommendation:** keep the app's physics (its tuning is the look), port it to typed arrays, and run it in a Web Worker that posts positions back, so the page stays responsive while it settles. The 180-step cap is hit at every size here, so larger graphs also never fully converge under the current limit.
+
+## Decision: Sigma.js adopted
+
+The dashboard now draws with Sigma.js 3.0.3 + graphology 0.25.4 (vendored, see `THIRD_PARTY_NOTICES.md`). `static/graph-view.js` exposes the slice of the Cytoscape API `index.html` uses (collections, classes, events, zoom/pan/animate, `layout`) over graphology and Sigma, so the application code kept its structure; styling is now two functions, `nodeStyle`/`edgeStyle`, evaluated on restyle.
+
+What changed in the look:
+
+- Kept: node colours (community / category), hexagon (repo) and diamond (service) shapes via custom node programs, labels, hover/selection/fade/exclude states, the glow overlay, culling by scope.
+- Changed: edges are straight and flat-coloured (target category) instead of gradient and curved; excluded nodes are dim fills instead of hollow rings; a highlighted node grows 1.35x instead of drawing a border ring.
+- Gone: the heavy-mode / viewport-culling / texture-on-viewport quality switches (`updateRenderQuality` is a no-op, `updateViewportCulling` only builds the on-screen node cache). Sigma's cost does not depend on them.
+
+## Scoped next step: layout off the main thread
+
+Not part of this change. Rendering is no longer the bottleneck; `forceDirectedSettle` is: 3 steps per frame at 67-103 ms/step (typed arrays) on 10-14k nodes blocks every frame for 200-300+ ms.
+
+1. Port `forceDirectedSettle` (Barnes-Hut quadtree, same constants) to flat `Float32Array`s; `bench/graph-render/layout-bench.js` has a typed-array quadtree to start from. Verify the output matches the current layout in compactness (0.059 / 0.187 / 0.079 at 1.5k / 9.7k / 14.2k).
+2. Run it in a Web Worker (inline via `Blob`, so no new static file or build step). Main thread sends ids, edges and start positions once; the worker posts a `Float32Array` of positions every N steps (transferable); the main thread writes them with one `setNodePositions` and a single refresh.
+3. Replace the fixed 180-step cap with convergence (max displacement below a threshold) bounded by a time budget, since every size hits the cap today without settling; keep the cap as the fallback.
+4. Cancel/restart the worker on repo switch and on scope change; keep the synchronous path as the fallback where `Worker` is unavailable.
+5. Acceptance: input latency (pan/zoom/hover) stays at frame rate while settling on the 9.7k and 14.2k graphs; final layout compactness within 5% of the current one.

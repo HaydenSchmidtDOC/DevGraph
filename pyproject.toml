@@ -52,7 +52,7 @@ include = ["devgraph*"]
 
 [tool.setuptools.package-data]
 # The dashboard's page and its vendored scripts (no CDN at runtime).
-"devgraph.dashboard" = ["static/*.html", "static/vendor/*.js"]
+"devgraph.dashboard" = ["static/*.html", "static/*.js", "static/vendor/*.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

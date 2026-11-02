@@ -851,7 +851,9 @@ table.dstable input[type="text"] { width: 100%; }
 <div id="tooltipBubble"></div>
 <div id="gitHoverCard"></div>
 
-<script src="/static/vendor/cytoscape-3.30.2.min.js"></script>
+<script src="/static/vendor/graphology-0.25.4.umd.min.js"></script>
+<script src="/static/vendor/sigma-3.0.3.min.js"></script>
+<script src="/static/graph-view.js"></script>
 <script>
 /* ── global fixed tooltip (not clipped by scroll containers) ─────── */
 /* Each trigger is focusable and described by the one shared bubble, which
@@ -1296,133 +1298,69 @@ function buildElements() {
   return els;
 }
 const STRUCTURAL_CATS = new Set(["repo","service","database","vectorstore","queue","cache","endpoint"]);
-const cy = cytoscape({
+/* The graph renderer is Sigma.js (WebGL) behind graph-view.js, which keeps the
+   small slice of the Cytoscape API this page uses. Cytoscape's canvas
+   renderer repainted the whole graph on every position write, which is what
+   made large repositories crawl (issue #54, docs/graph-render-benchmark.md).
+   The look lives here as two style callbacks, re-run for an element whenever
+   its classes or data change and for every element on cy.style().update(). */
+/* Sigma blends with premultiplied alpha (ONE, ONE_MINUS_SRC_ALPHA), so a translucent colour has to carry its
+   RGB already scaled by the alpha or it draws brighter than the opaque one. */
+function withAlpha(color, a) {
+  if (a >= 1) return color;
+  let r, g, b;
+  if (color[0] === "#") { const n = parseInt(color.slice(1), 16); r = (n>>16)&255; g = (n>>8)&255; b = n&255; }
+  else [r, g, b] = color.match(/\d+/g).map(Number);
+  return `rgba(${Math.round(r*a)},${Math.round(g*a)},${Math.round(b*a)},${a})`;
+}
+const NODE_SHAPES = { repo: "hexagon", service: "diamond" };
+function nodeStyle(n) {
+  const cat = n.data("cat"), hover = n.hasClass("hover-hl");
+  /* node.excluded was a hollow ring at 0.45 opacity; a dim fill is the closest cheap equivalent in WebGL */
+  const alpha = n.hasClass("faded") ? 0.07 : n.hasClass("excluded") ? 0.2 : 1;
+  const base = hover ? catColorBright(cat) : state.colorByCommunity ? communityColor(n.data("community")) : catColor(cat);
+  const label = n.hasClass("show-label") ? n.data("label") : "";
+  return {
+    hidden: n.hasClass("culled"),
+    color: withAlpha(base, alpha),
+    size: (STRUCTURAL_CATS.has(cat) ? 15 : 9) * GraphView.NODE_SIZE_SCALE * (n.hasClass("highlighted") ? 1.35 : 1),
+    shape: NODE_SHAPES[cat] || "circle",
+    label,
+    labelColor: hover ? "#ffffff" : "#8a8f98",
+    z: hover ? 20 : n.hasClass("highlighted") ? 10 : 0,
+  };
+}
+function edgeStyle(e) {
+  const hover = e.hasClass("hover-hl"), excluded = e.hasClass("excluded");
+  const glow = e.data("glow") || 0;
+  const alpha = e.hasClass("faded") ? 0.07 : hover ? 1 : excluded ? 0.25 : 0.35 + glow * 0.55;
+  /* the source-to-target gradient is not available on WebGL edges: edges take the target's colour, as heavy-mode always did */
+  const color = excluded ? "#62666d" : catColor(e.target().data("cat"));
+  return { hidden: e.hasClass("culled"), color: withAlpha(color, alpha), size: hover ? 2.2 : 1, z: hover ? 15 : 0 };
+}
+const cy = GraphView.create({
   container: document.getElementById("cy"),
   /* starts empty, not seeded with the mock graph -- buildElements() is only
      ever added if the boot check below finds Neo4j unreachable. Seeding it
      here unconditionally meant every real load flashed ~20 fake nodes on
      screen for the moment before the real fetch replaced them. */
-  elements: [],
-  wheelSensitivity: 0.15,
-  userZoomingEnabled: false, /* scroll-to-zoom stays off deliberately — use the +/- controls instead */
-  style: [
-    { selector: "node", style: {
-        "background-color": ele => state.colorByCommunity ? communityColor(ele.data("community")) : catColor(ele.data("cat")),
-        /* No label unless something is asking to read one. Text is the most
-           expensive thing in a canvas repaint and the ambient rotation
-           repaints on a tick, so a permanent label is paid for over and over
-           by a graph nobody is currently reading. Keying it off the query
-           match doesn't help either: the default query matches every node,
-           so every node would still be labelled. Names appear on demand
-           instead -- hovering a node, or hovering its type in the entity
-           list to name that whole type at once -- via .show-label below. */
-        "label": "",
-        /* subtle by default — dim, small, low-opacity; hover brightens it, doesn't resize it */
-        "color": "#8a8f98", "font-size": 7.5, "font-family": "var(--font-mono)",
-        "text-valign": "center", "text-halign": "right", "text-margin-x": 8, "text-opacity": 0.55,
-        "text-outline-color": "#08090a", "text-outline-width": 1.5, "text-outline-opacity": 0.7,
-        "width": ele => STRUCTURAL_CATS.has(ele.data("cat")) ? 15 : 9, "height": ele => STRUCTURAL_CATS.has(ele.data("cat")) ? 15 : 9,
-        /* Glow (query match / hover bloom) is drawn separately on glowCanvas
-           via renderGlow() below -- it never used this node's own canvas
-           shadow. Cytoscape shadow-blur is real per-node paint cost (shadow
-           blur isn't free), which is why it's user-toggleable (default on)
-           rather than always-on -- shadow-blur is forced to 0 when off, not
-           just shadow-opacity, since blur is what actually triggers the
-           expensive convolution regardless of opacity. Toggling calls
-           cy.style().update() (see the ctlShadowsEnabled listener) to force
-           these function values to re-evaluate. */
-        "shadow-blur": ele => state.shadowsEnabled ? 4 + (ele.data("glow")||0) * 16 : 0,
-        "shadow-color": ele => catColor(ele.data("cat")),
-        "shadow-opacity": ele => state.shadowsEnabled ? (ele.data("glow")||0) * 0.9 : 0,
-        "shadow-offset-x": 0, "shadow-offset-y": 0,
-        /* A thin border in the exact canvas background color (#08090a,
-           same constant as text-outline-color above) helps separate
-           adjacent same-color nodes in a tight cluster independently of
-           the shadow toggle above: it reads as a gap rather than a ring,
-           for the flat cost of a stroke() call -- no blur convolution. */
-        "border-width": 1, "border-color": "#08090a", "border-opacity": 0.1,
-        } },
-    { selector: "node.show-label", style: { "label": "data(label)" } },
-    { selector: "node[cat='repo']", style: { "shape":"round-hexagon" } },
-    { selector: "node[cat='service']", style: { "shape":"round-diamond" } },
-    { selector: "node[id='svc:neo4j']", style: { "text-halign": "left", "text-margin-x": -8 } },
-    { selector: "node.excluded", style: { "background-opacity": 0, "border-width": 1.3, "border-color": ele => catColor(ele.data("cat")), "border-opacity": 0.9, "opacity": 0.45 } },
-    /* beyond-the-ceiling elements aren't dimmed context like .excluded -- they
-       shouldn't cost draw time every frame at all. display:none pulls them out
-       of cytoscape's paint pass entirely instead of just fading them. */
-    { selector: "node.culled, edge.culled, node.offscreen, edge.offscreen", style: { "display": "none" } },
-    { selector: "edge", style: {
-        "width": 1,
-        "line-fill": "linear-gradient",
-        "line-gradient-stop-colors": ele => `${catColor(ele.source().data("cat"))} ${catColor(ele.target().data("cat"))}`,
-        "line-gradient-stop-positions": "0% 100%",
-        "curve-style": "unbundled-bezier", "control-point-distances": [16], "control-point-weights": [0.5],
-        "target-arrow-shape": "triangle", "target-arrow-color": ele => catColor(ele.target().data("cat")), "arrow-scale": 0.55,
-        "opacity": ele => 0.35 + (ele.data("glow")||0) * 0.55,
-        "shadow-blur": ele => state.shadowsEnabled ? (ele.data("glow")||0) * 16 : 0,
-        "shadow-color": ele => catColor(ele.source().data("cat")),
-        "shadow-opacity": ele => state.shadowsEnabled ? (ele.data("glow")||0) * 0.85 : 0,
-        "shadow-offset-x": 0, "shadow-offset-y": 0,
-    } },
-    { selector: "edge.excluded", style: { "line-fill": "solid", "line-color": "var(--meta)", "line-style": "dashed", "opacity": 0.25, "target-arrow-color": "var(--meta)" } },
-    /* heavy-mode: engaged only once the on-screen node count (post-culling)
-       crosses the user's render-quality threshold -- see updateHeavyMode().
-       Drops the per-edge gradient + bezier control points for a flat color
-       and a straight line, the two most expensive things left in an edge's
-       draw call once shadows are gone. */
-    { selector: "edge.heavy-mode", style: {
-        "line-fill": "solid", "line-color": ele => catColor(ele.target().data("cat")),
-        "curve-style": "straight",
-    } },
-    { selector: ".faded", style: { "opacity": 0.07 } },
-    { selector: "node.highlighted", style: { "border-width": 1.5, "border-color": "#7170ff", "border-opacity": 0.9, "z-index": 10 } },
-    { selector: "node.hover-hl", style: {
-        "background-color": ele => catColorBright(ele.data("cat")),
-        "color": "#ffffff", "text-opacity": 1, "text-outline-opacity": 0.9,
-        "shadow-blur": ele => state.shadowsEnabled ? 20 : 0, "shadow-color": ele => catColor(ele.data("cat")), "shadow-opacity": ele => state.shadowsEnabled ? 1 : 0,
-        "z-index": 20,
-    } },
-    { selector: "edge.hover-hl", style: { "width": 2.2, "opacity": 1, "shadow-blur": ele => state.shadowsEnabled ? 30 : 0, "shadow-opacity": ele => state.shadowsEnabled ? 1 : 0, "z-index": 15 } },
-  ],
-  layout: { name: "random" },
+  nodeStyle, edgeStyle,
   minZoom: 0.2, maxZoom: 3,
-  autoungrabify: true, /* dragging nodes is off entirely — the graph only pans/zooms/rotates now */
-  motionBlur: false, /* motion-blur trails are extra composited frames on top of a graph that's
-     already repainting every frame for the ambient rotation -- pure cost, no payoff here. */
-  pixelRatio: 1, /* retina displays otherwise render at 2-3x the canvas pixel count for zero
-     perceptible gain on a graph this dense -- cut it once, unconditionally, for every graph size. */
-  /* textureOnViewport/hideEdgesOnViewport start off so small graphs keep full fidelity while
-     panning; updateRenderQuality() (below) turns them on past RENDER_QUALITY_NODE_THRESHOLD
-     nodes, where per-frame paint cost is the actual bottleneck and the fidelity trade is worth it. */
-  textureOnViewport: false,
-  hideEdgesOnViewport: false,
+  labelFont: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
 });
-const RENDER_QUALITY_NODE_THRESHOLD = 800;
-/* re-evaluated after every add/remove (mergeGraphElements calls this) rather than
-   computed once at boot, since a repo switch or incremental load can cross the
-   threshold in either direction after the graph is already up. */
-function updateRenderQuality() {
-  const heavy = cy.nodes().length > RENDER_QUALITY_NODE_THRESHOLD;
-  const renderer = cy.renderer();
-  if (renderer) { renderer.hideEdgesOnViewport = heavy; renderer.textureOnViewport = heavy; }
-}
+function updateRenderQuality() { /* nothing to tune: the WebGL renderer has no per-viewport quality trade-offs */ }
 
 /* ── viewport culling ────────────────────────────────────────────────────
-   Cytoscape draws every non-culled, non-excluded element every repaint
-   regardless of whether it's actually inside the visible viewport -- a
-   graph loaded at 5000 nodes pays full paint cost for those 5000 nodes
-   even zoomed into a cluster of 20. This is the actual size-scaling
-   bottleneck behind both the zoom slowdown and the rotation stutter: every
-   rotation tick and every zoom-animation frame repaints the *whole* graph,
-   on-screen or not.
+   The WebGL renderer clips off-screen geometry on the GPU, so nothing is
+   hidden from it any more (Cytoscape's canvas paid for every element on
+   every repaint, which is why an .offscreen class used to pull them out of
+   its paint pass). What the page still needs is the list of on-screen
+   nodes: the glow layer and the ambient rotation iterate it so their cost
+   tracks what's visible rather than the whole graph, and heavy-mode is
+   judged against its length.
 
-   .offscreen (display:none, same "skip the paint pass entirely" mechanism
-   as .culled -- see the stylesheet) is kept in sync with the real viewport
-   here. A node is offscreen when it's outside the current extent plus a
-   margin (so a node near the edge doesn't pop in/out on every micro-pan);
-   an edge is offscreen only when BOTH endpoints are, so a relationship
-   crossing into view stays visible as long as either end is near/in frame.
-
+   A node counts as on screen when it's inside the current extent plus a
+   margin (so a node near the edge doesn't pop in/out on every micro-pan).
    Called wherever positions or the viewport can change: pan/zoom (debounced
    -- see scheduleViewportCulling below), every rotation tick, every settle
    animation frame, and after the graph is rebuilt/diffed. Returns the
@@ -1433,7 +1371,7 @@ const VIEWPORT_CULL_MARGIN_FRAC = 0.2;
 let lastOnscreenNodeCount = 0;
 /* Cache of the actual on-screen node elements (not just a count), rebuilt
    every full culling pass -- rotationTick's per-frame path (see below)
-   iterates this directly instead of re-deriving it from Cytoscape each
+   iterates this directly instead of re-deriving it from the graph each
    frame, so the smooth path only ever touches what's actually visible. */
 let cachedOnscreenNodes = [];
 function updateViewportCulling(marginFrac) {
@@ -1443,18 +1381,10 @@ function updateViewportCulling(marginFrac) {
   const frac = marginFrac ?? VIEWPORT_CULL_MARGIN_FRAC;
   const marginX = ext.w * frac, marginY = ext.h * frac;
   const x1 = ext.x1 - marginX, x2 = ext.x2 + marginX, y1 = ext.y1 - marginY, y2 = ext.y2 + marginY;
-  const offscreenIds = new Set();
   const onscreenNodes = [];
-  cy.batch(() => {
-    nodes.forEach(n => {
-      const p = n.position();
-      const offscreen = p.x < x1 || p.x > x2 || p.y < y1 || p.y > y2;
-      if (offscreen) offscreenIds.add(n.id()); else onscreenNodes.push(n);
-      n.toggleClass("offscreen", offscreen);
-    });
-    cy.edges().forEach(e => {
-      e.toggleClass("offscreen", offscreenIds.has(e.source().id()) && offscreenIds.has(e.target().id()));
-    });
+  nodes.forEach(n => {
+    const p = n.position();
+    if (!(p.x < x1 || p.x > x2 || p.y < y1 || p.y > y2)) onscreenNodes.push(n);
   });
   cachedOnscreenNodes = onscreenNodes;
   lastOnscreenNodeCount = onscreenNodes.length;

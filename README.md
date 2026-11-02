@@ -393,7 +393,7 @@ The Cypher console is bounded so a runaway query can't hold the Neo4j the watche
 
 With Neo4j down (say after a reboot, before the container or the Podman machine has started), the repository picker still lists the registered repositories, and a banner over the canvas says what the MCP tools say: `Neo4j isn't reachable at <uri>; start Neo4j (podman start devgraph-neo4j; on Windows and macOS run podman machine start first), then retry (devgraph doctor checks the connection)`, or, for a refused login, which settings to check. The console shows the same message instead of the driver's error, and the graph routes answer 503 with it.
 
-The page loads no script from the network: Cytoscape.js is vendored in the package (see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)), so the dashboard works offline.
+The page loads no script from the network: Sigma.js and graphology are vendored in the package (see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)), so the dashboard works offline.
 
 The service binds to loopback and has no authentication because it is intended as a single-user local tool. The browser never receives Neo4j credentials; graph queries run through the FastAPI backend. Use `DEVGRAPH_DASHBOARD_ENABLED=false` to disable it or `DEVGRAPH_DASHBOARD_PORT` to choose another port. If another program already holds the port, the agent keeps running without the dashboard and says so: a warning in its log naming the port, `dashboard port <port> in use` in the tray tooltip, and a line under `Dashboard` in `devgraph status`. `devgraph dashboard` checks the port answers as DevGraph (`GET /api/health`) and will not open a browser on another program's page.
 
