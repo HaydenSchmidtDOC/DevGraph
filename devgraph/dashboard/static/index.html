@@ -2774,7 +2774,9 @@ async function refreshGraph(mode, record, structural) {
     await loadCachedLayout();
   }
   const q = currentStateQuery();
-  const replace = structural || !state.highlightMode;
+  /* With nothing isolated the canvas must show exactly the base query: nodes an earlier isolate pulled in would
+     otherwise linger as dimmed rings after un-isolating. */
+  const replace = structural || !state.highlightMode || (state.isolatedEntity === null && state.isolatedRel === null);
   let ok = false;
   try {
     const res = await runQueryAndUpdateGraph(q, { record, mode, replace, canvas: true });
