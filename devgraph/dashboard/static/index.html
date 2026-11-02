@@ -1316,15 +1316,16 @@ function withAlpha(color, a) {
 const NODE_SHAPES = { repo: "hexagon", service: "diamond" };
 function nodeStyle(n) {
   const cat = n.data("cat"), hover = n.hasClass("hover-hl");
-  /* node.excluded was a hollow ring at 0.45 opacity; a dim fill is the closest cheap equivalent in WebGL */
-  const alpha = n.hasClass("faded") ? 0.07 : n.hasClass("excluded") ? 0.2 : 1;
+  /* excluded nodes are hollow rings at 0.45 opacity, as before; the hexagon/diamond shapes stay filled but dim */
+  const excluded = n.hasClass("excluded"), shape = NODE_SHAPES[cat];
+  const alpha = n.hasClass("faded") ? 0.07 : excluded ? (shape ? 0.3 : 0.45) : 1;
   const base = hover ? catColorBright(cat) : state.colorByCommunity ? communityColor(n.data("community")) : catColor(cat);
   const label = n.hasClass("show-label") ? n.data("label") : "";
   return {
     hidden: n.hasClass("culled"),
     color: withAlpha(base, alpha),
     size: (STRUCTURAL_CATS.has(cat) ? 15 : 9) * GraphView.NODE_SIZE_SCALE * (n.hasClass("highlighted") ? 1.35 : 1),
-    shape: NODE_SHAPES[cat] || "circle",
+    shape: shape || (excluded ? "ring" : "circle"),
     label,
     labelColor: hover ? "#ffffff" : "#8a8f98",
     z: hover ? 20 : n.hasClass("highlighted") ? 10 : 0,

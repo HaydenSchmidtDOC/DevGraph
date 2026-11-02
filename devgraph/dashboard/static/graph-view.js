@@ -316,6 +316,7 @@
       circle: Sigma.rendering.NodeCircleProgram,
       hexagon: makeShapeProgram("max(q.x * 0.8660254 + q.y * 0.5, q.y) - r * 0.8660254"),
       diamond: makeShapeProgram("(q.x + q.y) * 0.7071068 - r * 0.7071068 * 1.2"),
+      ring: makeShapeProgram("abs(length(q) - r * 0.75) - r * 0.25"), /* hollow circle: nodes outside the current query's matches */
     };
     const edgeProgramClasses = {
       straight: makeGradientEdgeProgram(1, 0),
@@ -475,7 +476,7 @@
         } else graph.dropEdge(e.id());
         byId.delete(e.id());
       }
-      listsStale = true; dirtyAll = false; movedAll = true; schedule();
+      listsStale = true; movedAll = true; schedule();
     };
     cy.getElementById = id => byId.get(id) || EMPTY_COLL;
     cy.nodes = function (sel) { listsRebuild(); const c = new Coll(cy, nodes.slice()); return sel ? c.filter(sel) : c; };
