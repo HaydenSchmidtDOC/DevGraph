@@ -23,7 +23,7 @@
      value only sets the scale of Sigma's internal 0..1 space. */
   const L = 1000;
   const CURVE_SEGMENTS = 10, CURVE_BEND = 0.15; /* bezier pieces per curved edge; control point offset as a fraction of the edge length */
-  const NODE_SIZE_SCALE = 0.25; /* a quarter of the old Cytoscape node diameter (9 px, 15 px for repo/service at zoom 1); Sigma draws `size` as the diameter (see zoomToSizeRatioFunction) */
+  const NODE_SIZE_SCALE = 0.375; /* 3/8 of the old Cytoscape node diameter (9 px, 15 px for repo/service at zoom 1); Sigma draws `size` as the diameter (see zoomToSizeRatioFunction) */
 
   /* ── node shapes ───────────────────────────────────────────────────────
      Sigma ships circles only. The dashboard draws repositories as hexagons
