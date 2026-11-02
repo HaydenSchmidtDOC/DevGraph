@@ -1,0 +1,179 @@
+<!doctype html>
+<meta charset="utf-8"><title>render bench</title>
+<style>html,body{margin:0;background:#08090a;overflow:hidden}#v{position:fixed;inset:0}</style>
+<div id="v"></div>
+<script src="node_modules/cytoscape/dist/cytoscape.min.js"></script>
+<script src="node_modules/graphology/dist/graphology.umd.min.js"></script>
+<script src="node_modules/sigma/dist/sigma.min.js"></script>
+<script src="node_modules/force-graph/dist/force-graph.min.js"></script>
+<script>
+/* Isolated render benchmark for issue #54. ?engine=<name>&data=<file>[&cap=<nodes>][&ms=<per scenario>]
+   Data comes from export.js (a real registered repo's graph + a settled layout), so every
+   engine draws identical geometry; layout cost is not what's measured, only drawing. */
+const Q = new URLSearchParams(location.search);
+const ENGINE = Q.get("engine");
+const CATS = {repo:"#b7b3ff",service:"#7c8dff",module:"#22c3e6",class:"#22c55e",function:"#a3e635",endpoint:"#fbbf24",database:"#f0813c",vectorstore:"#dc2626",queue:"#e0559e",cache:"#c084fc",phase2:"#9299a6"};
+const STRUCT = new Set(["repo","service","database","vectorstore","queue","cache","endpoint"]);
+const nsz = n => STRUCT.has(n.cat) ? 15 : 9;
+const W = innerWidth, H = innerHeight;
+let D, N, bounds, fit, base;
+async function load() {
+  const raw = await (await fetch("data/" + Q.get("data") + ".json")).json();
+  const cap = +Q.get("cap") || raw.nodes.length;
+  const nodes = raw.nodes.slice(0, cap).map((n, i) => ({ id: "n" + i, x: n[0], y: n[1], cat: n[2], c: n[3] }));
+  const edges = [];
+  raw.edges.forEach((e, i) => { if (e[0] < cap && e[1] < cap) edges.push({ id: "e" + i, s: "n" + e[0], t: "n" + e[1] }); });
+  D = { nodes, edges }; N = nodes.length;
+  let a = 1e9, b = 1e9, c = -1e9, d = -1e9;
+  for (const n of nodes) { a = Math.min(a, n.x); b = Math.min(b, n.y); c = Math.max(c, n.x); d = Math.max(d, n.y); }
+  bounds = { cx: (a + c) / 2, cy: (b + d) / 2, w: c - a, h: d - b };
+  fit = Math.min(W / bounds.w, H / bounds.h) * .92;
+  base = nodes.map(n => ({ x: n.x, y: n.y }));
+}
+const rot = a => { const c = Math.cos(a), s = Math.sin(a); D.nodes.forEach((n, i) => { const dx = base[i].x - bounds.cx, dy = base[i].y - bounds.cy; n.x = bounds.cx + dx * c - dy * s; n.y = bounds.cy + dx * s + dy * c; }); };
+const el = document.getElementById("v");
+const E = {};
+
+/* ── A/B. Cytoscape, styled and tuned the way index.html ships it (canvas) or with its WebGL renderer ── */
+function cyEngine(webgl, cull) {
+  let cy;
+  const lite = webgl || N > 1600; // index.html "heavy-mode": flat colour + straight edges past renderThreshold (1600)
+  const style = [
+    { selector: "node", style: { "background-color": e => CATS[e.data("cat")], width: e => STRUCT.has(e.data("cat")) ? 15 : 9, height: e => STRUCT.has(e.data("cat")) ? 15 : 9, label: "", "border-width": 1, "border-color": "#08090a", "border-opacity": .1 } },
+    { selector: "node[cat='repo']", style: { shape: "round-hexagon" } },
+    { selector: "node[cat='service']", style: { shape: "round-diamond" } },
+    { selector: "edge", style: lite
+      ? { width: 1, "line-color": e => CATS[e.target().data("cat")], "curve-style": "straight", "target-arrow-shape": "triangle", "target-arrow-color": e => CATS[e.target().data("cat")], "arrow-scale": .55, opacity: .35 }
+      : { width: 1, "line-fill": "linear-gradient", "line-gradient-stop-colors": e => `${CATS[e.source().data("cat")]} ${CATS[e.target().data("cat")]}`, "line-gradient-stop-positions": "0% 100%", "curve-style": "unbundled-bezier", "control-point-distances": [16], "control-point-weights": [.5], "target-arrow-shape": "triangle", "target-arrow-color": e => CATS[e.target().data("cat")], "arrow-scale": .55, opacity: .35 } },
+    { selector: ".offscreen", style: { display: "none" } },
+  ];
+  return {
+    build() {
+      const o = { container: el, elements: [...D.nodes.map(n => ({ data: { id: n.id, cat: n.cat }, position: { x: n.x, y: n.y } })), ...D.edges.map(e => ({ data: { id: e.id, source: e.s, target: e.t } }))],
+        style, layout: { name: "preset" }, userZoomingEnabled: false, autoungrabify: true, pixelRatio: 1, motionBlur: false, minZoom: .001, maxZoom: 10,
+        textureOnViewport: !webgl && N > 800, hideEdgesOnViewport: !webgl && N > 800 };
+      if (webgl) o.renderer = { name: "canvas", webgl: true };
+      cy = cytoscape(o);
+      cy.zoom(fit); cy.pan({ x: W / 2 - bounds.cx * fit, y: H / 2 - bounds.cy * fit });
+      this.cullPass = () => { // same shape as updateViewportCulling() in index.html
+        const ext = cy.extent(), mx = ext.w * .2, my = ext.h * .2, off = new Set();
+        cy.batch(() => {
+          cy.nodes().forEach(n => { const p = n.position(), o = p.x < ext.x1 - mx || p.x > ext.x2 + mx || p.y < ext.y1 - my || p.y > ext.y2 + my; if (o) off.add(n.id()); n.toggleClass("offscreen", o); });
+          cy.edges().forEach(e => e.toggleClass("offscreen", off.has(e.source().id()) && off.has(e.target().id())));
+        });
+      };
+      if (cull) { let t; cy.on("pan zoom", () => { clearTimeout(t); t = setTimeout(this.cullPass, 100); }); this.cullPass(); }
+    },
+    setView(z, px, py) { const zz = fit * z; cy.viewport({ zoom: zz, pan: { x: W / 2 - bounds.cx * zz + px, y: H / 2 - bounds.cy * zz + py } }); },
+    rotate(a) { rot(a); cy.batch(() => D.nodes.forEach(n => cy.getElementById(n.id).position({ x: n.x, y: n.y }))); },
+    // programmatic viewport() doesn't engage Cytoscape's hideEdgesOnViewport/textureOnViewport (they key off a
+    // real mouse drag/wheel); flag one so pan/zoom here is measured the way a user drag actually renders.
+    interact(on) { const r = cy.renderer(); if (r && r.hoverData) r.hoverData.dragging = on; },
+    destroy() { cy.destroy(); },
+  };
+}
+E["cy-canvas"] = () => cyEngine(false, true);
+E["cy-webgl"] = () => cyEngine(true, false);
+
+/* ── C. Sigma.js 3 (WebGL) + graphology ── */
+E["sigma"] = () => {
+  let s, g, cam;
+  return {
+    build() {
+      g = new graphology.Graph({ multi: true });
+      D.nodes.forEach(n => g.addNode(n.id, { x: n.x, y: -n.y, size: nsz(n) / 2, color: CATS[n.cat] }));
+      D.edges.forEach(e => g.addEdgeWithKey(e.id, e.s, e.t, { size: 1, color: "rgba(150,160,180,0.35)", type: "arrow" }));
+      s = new Sigma(g, el, { defaultEdgeType: "arrow", renderLabels: false, renderEdgeLabels: false, minCameraRatio: .001, maxCameraRatio: 100 });
+      cam = s.getCamera();
+    },
+    setView(z, px, py) {
+      const m = Math.max(W, H), ratio = 1 / z;
+      cam.setState({ x: .5 - px / m * ratio, y: .5 - py / m * ratio, ratio, angle: cam.angle });
+    },
+    rotate(a) { rot(a); g.updateEachNodeAttributes((id, at) => { const n = D.nodes[+id.slice(1)]; at.x = n.x; at.y = -n.y; return at; }, { attributes: ["x", "y"] }); },
+    rotateView(a) { cam.setState({ angle: a }); },
+    destroy() { s.kill(); },
+  };
+};
+
+/* ── D. force-graph (vasturiano; canvas2D, d3-force underneath) ── */
+E["force-graph"] = () => {
+  let fg, nodes;
+  return {
+    build() {
+      nodes = D.nodes.map(n => ({ id: n.id, cat: n.cat, x: n.x, y: n.y, fx: n.x, fy: n.y, _n: n }));
+      const links = D.edges.map(e => ({ source: e.s, target: e.t }));
+      fg = ForceGraph()(el).width(W).height(H).backgroundColor("#08090a").graphData({ nodes, links }).cooldownTicks(0).warmupTicks(0)
+        .nodeRelSize(4).nodeColor(n => CATS[n.cat]).nodeVal(n => STRUCT.has(n.cat) ? 3 : 1).nodeLabel(() => "").linkColor(() => "rgba(150,160,180,0.35)")
+        .linkDirectionalArrowLength(3).linkDirectionalArrowRelPos(1).enableNodeDrag(false).autoPauseRedraw(false);
+      fg.zoom(fit, 0); fg.centerAt(bounds.cx, bounds.cy, 0);
+    },
+    setView(z, px, py) { fg.zoom(fit * z, 0); fg.centerAt(bounds.cx - px / (fit * z), bounds.cy - py / (fit * z), 0); },
+    rotate(a) { rot(a); nodes.forEach(n => { n.x = n.fx = n._n.x; n.y = n.fy = n._n.y; }); },
+    destroy() { fg._destructor && fg._destructor(); },
+  };
+};
+
+/* ── E. hand-rolled batched Canvas2D (what a d3-force + canvas rewrite would draw with) ── */
+E["canvas2d-batched"] = () => {
+  let cv, ctx, vz, vx = 0, vy = 0, raf = 0, dirty = true, NM;
+  const draw = () => {
+    const z = vz, tx = W / 2 - bounds.cx * z + vx, ty = H / 2 - bounds.cy * z + vy;
+    ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.fillStyle = "#08090a"; ctx.fillRect(0, 0, W, H);
+    ctx.setTransform(z, 0, 0, z, tx, ty);
+    const x1 = -tx / z - 20, x2 = (W - tx) / z + 20, y1 = -ty / z - 20, y2 = (H - ty) / z + 20;
+    const on = n => n.x >= x1 && n.x <= x2 && n.y >= y1 && n.y <= y2;
+    ctx.lineWidth = 1 / z; ctx.globalAlpha = .35;
+    const buckets = {};
+    for (const e of D.edges) { const a = NM[e.s], b = NM[e.t]; if (!on(a) && !on(b)) continue; (buckets[b.cat] || (buckets[b.cat] = [])).push(a, b); }
+    for (const k in buckets) { ctx.strokeStyle = CATS[k]; ctx.beginPath(); const arr = buckets[k]; for (let i = 0; i < arr.length; i += 2) { ctx.moveTo(arr[i].x, arr[i].y); ctx.lineTo(arr[i + 1].x, arr[i + 1].y); } ctx.stroke(); }
+    ctx.globalAlpha = 1;
+    const nb = {}; for (const n of D.nodes) if (on(n)) (nb[n.cat] || (nb[n.cat] = [])).push(n);
+    for (const k in nb) { ctx.fillStyle = CATS[k]; ctx.beginPath(); const r = nsz({ cat: k }) / 2; for (const n of nb[k]) { ctx.moveTo(n.x + r, n.y); ctx.arc(n.x, n.y, r, 0, 6.2832); } ctx.fill(); }
+    dirty = false;
+  };
+  return {
+    build() {
+      vz = fit; NM = {}; D.nodes.forEach(n => NM[n.id] = n);
+      cv = document.createElement("canvas"); cv.width = W; cv.height = H; cv.style.cssText = "position:absolute;inset:0"; el.appendChild(cv); ctx = cv.getContext("2d");
+      const loop = () => { if (dirty) draw(); raf = requestAnimationFrame(loop); }; loop();
+    },
+    setView(z, px, py) { vz = fit * z; vx = px; vy = py; dirty = true; },
+    rotate(a) { rot(a); dirty = true; },
+    destroy() { cancelAnimationFrame(raf); },
+  };
+};
+
+/* ── scenarios: each steps the view/positions once per animation frame and records frame intervals ── */
+const raf2 = () => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+async function scenario(name, ms, step) {
+  const ts = []; const t0 = performance.now(); let last = t0, busy = 0;
+  for (;;) {
+    const now = await new Promise(r => requestAnimationFrame(r));
+    ts.push(now - last); last = now;
+    const p = (now - t0) / ms; if (p > 1) break;
+    const b = performance.now(); step(p); busy += performance.now() - b;
+  }
+  ts.shift(); const mean = ts.reduce((a, b) => a + b, 0) / ts.length; ts.sort((a, b) => a - b);
+  const q = f => ts[Math.min(ts.length - 1, Math.floor(ts.length * f))];
+  return { name, frames: ts.length, fps: +(1000 / mean).toFixed(1), medianMs: +q(.5).toFixed(1), p95Ms: +q(.95).toFixed(1), maxMs: +ts[ts.length - 1].toFixed(1), jsStepMsPerFrame: +(busy / ts.length).toFixed(2) };
+}
+window.runBench = async () => {
+  await load();
+  const eng = E[ENGINE]();
+  const t0 = performance.now(); eng.build(); await raf2();
+  const out = { engine: ENGINE, data: Q.get("data"), cap: +Q.get("cap") || 0, nodes: N, edges: D.edges.length, buildMs: Math.round(performance.now() - t0), scenarios: [] };
+  const MS = +Q.get("ms") || 3000;
+  eng.setView(1, 0, 0); await raf2();
+  out.scenarios.push(await scenario("idle", 1000, () => {}));
+  eng.interact && eng.interact(true);
+  out.scenarios.push(await scenario("pan", MS, p => eng.setView(1, Math.sin(p * 6.283) * W * .25, Math.cos(p * 6.283) * H * .15)));
+  out.scenarios.push(await scenario("zoom", MS, p => eng.setView(1 + (p < .5 ? p : 1 - p) * 8, 0, 0)));
+  eng.interact && eng.interact(false);
+  eng.setView(1, 0, 0); await raf2();
+  out.scenarios.push(await scenario("rotate-positions", MS, p => eng.rotate(p * .35)));
+  if (eng.rotateView) { eng.rotate(0); out.scenarios.push(await scenario("rotate-camera", MS, p => eng.rotateView(p * .35))); }
+  eng.destroy();
+  return out;
+};
+</script>
