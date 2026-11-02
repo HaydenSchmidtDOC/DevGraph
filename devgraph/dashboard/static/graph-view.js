@@ -332,7 +332,7 @@
       labelColor: { color: "#8a8f98" },
       defaultDrawNodeHover: () => {}, /* the page draws its own hover treatment; Sigma's default is a white label box */
       enableEdgeEvents: true,
-      itemSizesReference: "screen",
+      itemSizesReference: "positions",
       zoomToSizeRatioFunction: () => 1,
       stagePadding: 0,
       autoRescale: false,

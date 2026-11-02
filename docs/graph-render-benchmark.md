@@ -89,7 +89,7 @@ What changed in the look:
 
 - Kept: node colours (community / category), hexagon (repo) and diamond (service) shapes via custom node programs, labels, hover/selection/fade/exclude states, the glow overlay, culling by scope.
 - Edges: restored as source-to-target gradients with arrowheads by a custom GPU edge program (`makeGradientEdgeProgram`). Up to 3,000 nodes they are curved (quadratic bezier, 10 segments per edge); past that they are straight gradients, one quad per edge like Sigma's own line. The curve limit mirrors the old heavy-mode cutoff and is only checked on the dashboard's default 2.3k-node view: panning there measured 24-25 fps curved against 16-38 fps straight on this machine (run-to-run noise exceeded the difference, and the page's own pan handlers set the ceiling), so curves cost nothing measurable at that size. Larger graphs have not been timed with curves.
-- Sizes: node size and line thickness stay constant on screen when zooming (`itemSizesReference: "screen"`); Cytoscape's grew with zoom.
+- Sizes: node size and line thickness scale with zoom, as Cytoscape's did (`itemSizesReference: "positions"`).
 - Changed: excluded nodes are dim fills instead of hollow rings; a highlighted node grows 1.35x instead of drawing a border ring.
 - Gone: the heavy-mode / viewport-culling / texture-on-viewport quality switches (`updateRenderQuality` is a no-op, `updateViewportCulling` only builds the on-screen node cache). Sigma's cost does not depend on them.
 
