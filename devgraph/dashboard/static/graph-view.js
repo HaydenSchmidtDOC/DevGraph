@@ -23,7 +23,7 @@
      value only sets the scale of Sigma's internal 0..1 space. */
   const L = 1000;
   const CURVE_SEGMENTS = 10, CURVE_BEND = 0.15; /* bezier pieces per curved edge; control point offset as a fraction of the edge length */
-  const NODE_SIZE_SCALE = 0.5; /* Cytoscape node `width` is a diameter in px; Sigma `size` is a radius */
+  const NODE_SIZE_SCALE = 1; /* Cytoscape `width` is a diameter in px at zoom 1; Sigma draws `size` as the diameter too (see zoomToSizeRatioFunction) */
 
   /* ── node shapes ───────────────────────────────────────────────────────
      Sigma ships circles only. The dashboard draws repositories as hexagons
@@ -304,6 +304,7 @@
     let batchDepth = 0;
     const curvedLimit = opts.curvedEdgeLimit ?? 3000; /* curved edges cost ~10x the triangles; past this many nodes they go straight */
     let curved = true;
+    let kPx = 1; /* see k(); the size function above reads it on every render */
 
     const cy = {
       _byId: byId,
@@ -332,8 +333,9 @@
       labelColor: { color: "#8a8f98" },
       defaultDrawNodeHover: () => {}, /* the page draws its own hover treatment; Sigma's default is a white label box */
       enableEdgeEvents: true,
-      itemSizesReference: "positions",
-      zoomToSizeRatioFunction: () => 1,
+      /* sizes are screen pixels at zoom 1 and scale linearly with the zoom, like Cytoscape's: Sigma divides by this */
+      itemSizesReference: "screen",
+      zoomToSizeRatioFunction: r => r * L / kPx,
       stagePadding: 0,
       autoRescale: false,
       hideEdgesOnMove: false,
@@ -355,7 +357,7 @@
       return Math.abs(B.x - A.x) * camera.ratio;
     }
     function applyZoomLimits() {
-      const kk = k();
+      const kk = kPx = k();
       sigma.setSetting("minCameraRatio", kk / (maxZoom * L));
       sigma.setSetting("maxCameraRatio", kk / (minZoom * L));
     }
