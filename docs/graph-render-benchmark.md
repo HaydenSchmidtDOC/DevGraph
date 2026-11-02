@@ -58,3 +58,25 @@ Not benchmarked (judged on design, not measured): Cosmograph/cosmos.gl (GPU forc
 ## What a Sigma migration costs (against "keep 90% of the look")
 
 Sigma has no built-in hexagon/diamond node shapes, gradient edges, or per-element style functions, and `index.html` uses the Cytoscape API at roughly 90 sites (selection/hover classes, culling, settle and rotation position writes, tap handlers, diffed updates, layout save/restore). Keeping the look needs custom node programs (hexagon, diamond, hover halo), the edge gradient replaced by a source-coloured edge with an arrowhead, and the glow canvas re-anchored to Sigma's camera. The force-directed settle (`forceDirectedSettle`, Barnes-Hut) can stay as it is: it only needs node positions.
+
+## Layout: d3-force against the app's settle
+
+d3-force is a layout library, not a renderer, so it only matters for `forceDirectedSettle`. `bench/graph-render/layout-bench.js` runs three layouts on the same real graphs from the same random start (Node, single thread): the app's settle ported line for line, the same physics on typed arrays, and d3-force (`forceLink` + `forceManyBody` at theta 0.9 + `forceX/Y`, d3's default 300 ticks). Compactness is mean edge length divided by mean random-pair distance (lower is tighter).
+
+| Graph | Layout | Total | ms/step | Steps | Compactness |
+|---|---|---|---|---|---|
+| 1.5k | app | 1.4 s | 7.8 | 180 | 0.059 |
+| | app, typed arrays | 1.1 s | 6.2 | 180 | 0.059 |
+| | d3-force | 2.9 s | 9.7 | 300 | 0.065 |
+| 9.7k | app | 16.0 s | 89 | 180 | 0.187 |
+| | app, typed arrays | 12.1 s | 67 | 180 | 0.187 |
+| | d3-force | 29.7 s | 99 | 300 | 0.190 |
+| 14.2k | app | 29.0 s | 161 | 180 | 0.079 |
+| | app, typed arrays | 18.6 s | 103 | 180 | 0.079 |
+| | d3-force | 38.8 s | 129 | 300 | 0.088 |
+| 56.8k | app, typed arrays | 91 s | 507 | 180 | 0.033 |
+| | d3-force | 227 s | 757 | 300 | 0.035 |
+
+- **d3-force is not an improvement.** It costs more per step and needs more steps, for a layout no tighter than the app's. Its Barnes-Hut is the same technique the app already uses. Switching would change the layout's character for no gain.
+- **The real problem is where the settle runs.** The app runs 3 steps per animation frame on the main thread, so a frame is blocked for ~270 ms at 9.7k nodes and ~480 ms at 14.2k, before Cytoscape repaints anything. Typed arrays cut that by 25-35%, but the cost stays far above a frame budget at any size past a few thousand nodes.
+- **Recommendation:** keep the app's physics (its tuning is the look), port it to typed arrays, and run it in a Web Worker that posts positions back, so the page stays responsive while it settles. The 180-step cap is hit at every size here, so larger graphs also never fully converge under the current limit.
