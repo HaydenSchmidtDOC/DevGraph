@@ -2712,8 +2712,19 @@ async function runQueryAndUpdateGraph(query, opts) {
   const json = await runCypher(query, { record: !!opts?.record, canvas: !!opts?.canvas });
   if (json.errors?.length) return { ok: false, json };
   const result = json.results[0];
-  const elements = mapGraphResultToElements(result.data);
+  let elements = mapGraphResultToElements(result.data);
   if (!elements.length) return { ok: false, json };
+  /* Highlight-only mode dims, it doesn't grow the canvas: a query's unmatched
+     context nodes (the OPTIONAL MATCH neighbours) stay off screen unless
+     they're already there, so isolating a type never adds hundreds of dimmed
+     nodes or re-settles for them. Matched nodes that aren't on the canvas yet
+     are still added. */
+  if (!opts?.replace) {
+    const m = extractStateMatchedIds(json);
+    const keep = new Set(elements.filter(el => !el.data.source && (m.nodeIds.has(el.data.id) || cy.getElementById(el.data.id).nonempty())).map(el => el.data.id));
+    elements = elements.filter(el => el.data.source ? keep.has(el.data.source) && keep.has(el.data.target) : keep.has(el.data.id));
+    if (!elements.length) return { ok: false, json };
+  }
   /* Supersession has to be decided BEFORE anything touches cy, not after.
      This check used to sit below the merge, which meant a stale reply still
      got to mutate the canvas first: in replace mode ({remove, settle}) it
