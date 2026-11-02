@@ -2721,7 +2721,7 @@ async function runQueryAndUpdateGraph(query, opts) {
      are still added. */
   if (!opts?.replace) {
     const m = extractStateMatchedIds(json);
-    const keep = new Set(elements.filter(el => !el.data.source && (m.nodeIds.has(el.data.id) || cy.getElementById(el.data.id).nonempty())).map(el => el.data.id));
+    const keep = new Set(elements.filter(el => !el.data.source && (m.nodeIds.has(el.data.id) || cy.getElementById(el.data.id).length)).map(el => el.data.id));
     elements = elements.filter(el => el.data.source ? keep.has(el.data.source) && keep.has(el.data.target) : keep.has(el.data.id));
     if (!elements.length) return { ok: false, json };
   }
