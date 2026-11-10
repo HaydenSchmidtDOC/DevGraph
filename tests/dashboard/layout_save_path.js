@@ -201,14 +201,14 @@ function runSyncChecks() {
    nobody wants, too narrow and structural nodes go unnamed. */
 function runLabelChecks() {
   check("no node carries a label by default",
-    /"label": "",/.test(html),
-    "the base node style labels something; every repaint would pay for that text");
+    /const label = n\.hasClass\("show-label"\) \? n\.data\("label"\) : "";/.test(html),
+    "nodeStyle labels something by default; every repaint would pay for that text");
   check("a permanent label mapper has not crept back in",
     !/"label": ele =>/.test(html),
     "the base label is computed again, so some nodes are labelled without being asked for");
   check("hover names a node (.show-label is what turns a label on)",
-    /selector: "node\.show-label", style: \{ "label": "data\(label\)" \}/.test(html),
-    "the .show-label rule is gone, so nothing could ever be named");
+    /n\.hasClass\("show-label"\) \? n\.data\("label"\)/.test(html),
+    "nodeStyle no longer reads .show-label, so nothing could ever be named");
   check("hovering a node adds show-label",
     /cy\.on\("mouseover", "node", e => \{ e\.target\.addClass\("show-label hover-hl"\)/.test(html),
     "node hover no longer labels");

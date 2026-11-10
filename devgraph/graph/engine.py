@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import posixpath
+import re
 import threading
 import time
 from contextlib import contextmanager
@@ -2966,9 +2967,17 @@ class GraphEngine:
         `timeout_s` is the server-side transaction timeout; `max_rows` stops
         pulling rows after that many (see `_graph_shaped`).
         """
-        with self._driver.session() as session:
-            result = session.run(Query(query, timeout=timeout_s), parameters or {})  # type: ignore[arg-type]
-            return _graph_shaped(result, max_rows)
+
+        def run() -> dict[str, Any]:
+            with self._driver.session() as session:
+                result = session.run(Query(query, timeout=timeout_s), parameters or {})  # type: ignore[arg-type]
+                return _graph_shaped(result, max_rows)
+
+        # The watcher writes while the console reads, and Neo4j then fails a
+        # read mid-result with a transient "Outdated" error that a re-run
+        # clears. Only a plain read is re-run: an arbitrary write is not
+        # known to be safe to repeat.
+        return _retry_transient(run) if _READ_ONLY_QUERY.match(query) and not _WRITE_WORD.search(query) else run()
 
     def preview_cypher_graph(
         self,
@@ -2988,6 +2997,10 @@ class GraphEngine:
 
         with self._driver.session(default_access_mode=READ_ACCESS) as session:
             return session.execute_read(work)
+
+
+_READ_ONLY_QUERY = re.compile(r"\s*(?:OPTIONAL\s+MATCH|MATCH|WITH|RETURN|UNWIND)\b", re.IGNORECASE)
+_WRITE_WORD = re.compile(r"\b(?:CREATE|MERGE|DELETE|DETACH|SET|REMOVE|DROP|CALL|LOAD|FOREACH|TERMINATE|SHOW)\b", re.IGNORECASE)
 
 
 def _graph_shaped(result: Any, max_rows: int | None = None) -> dict[str, Any]:
